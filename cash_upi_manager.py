@@ -6,79 +6,65 @@ import pandas as pd
 import streamlit as st
 
 # =========================================================
-# APP CONFIG
+# APP CONFIG & INITIALIZATION
 # =========================================================
 st.set_page_config(
-    page_title="Cash & UPI Money Manager",
-    page_icon="💰",
-    layout="wide",
+    page_title="Vault | Mobile Money",
+    page_icon="🏦",
+    layout="centered",
+    initial_sidebar_state="collapsed",
 )
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_FILE = BASE_DIR / "cash_upi_money_manager.db"
 
+if "dark_mode" not in st.session_state:
+    st.session_state.dark_mode = True 
+if "active_tab" not in st.session_state:
+    st.session_state.active_tab = "Home"
+
 
 # =========================================================
-# DATABASE
+# DATABASE (Core Logic Retained)
 # =========================================================
 def get_db():
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     return conn
 
-
 def init_db():
     conn = get_db()
     cur = conn.cursor()
-
     cur.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tx_date TEXT NOT NULL,
-            tx_type TEXT NOT NULL,
-            amount REAL NOT NULL CHECK(amount > 0),
-            wallet TEXT,
-            from_wallet TEXT,
-            to_wallet TEXT,
-            person TEXT,
-            category TEXT,
-            due_date TEXT,
-            note TEXT DEFAULT '',
-            created_at TEXT NOT NULL
+            id INTEGER PRIMARY KEY AUTOINCREMENT, tx_date TEXT NOT NULL, tx_type TEXT NOT NULL,
+            amount REAL NOT NULL CHECK(amount > 0), wallet TEXT, from_wallet TEXT, to_wallet TEXT,
+            person TEXT, category TEXT, due_date TEXT, note TEXT DEFAULT '', created_at TEXT NOT NULL
         )
     """)
-
     cur.execute("""
         CREATE TABLE IF NOT EXISTS fds (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            start_date TEXT NOT NULL,
-            amount REAL NOT NULL CHECK(amount > 0),
-            interest_rate REAL DEFAULT 0,
-            maturity_date TEXT,
-            bank_name TEXT DEFAULT '',
-            note TEXT DEFAULT '',
-            status TEXT NOT NULL DEFAULT 'Active',
-            created_at TEXT NOT NULL
+            id INTEGER PRIMARY KEY AUTOINCREMENT, start_date TEXT NOT NULL, amount REAL NOT NULL CHECK(amount > 0),
+            interest_rate REAL DEFAULT 0, maturity_date TEXT, bank_name TEXT DEFAULT '',
+            note TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'Active', created_at TEXT NOT NULL
         )
     """)
-
     conn.commit()
     conn.close()
 
-
 init_db()
 
-
 # =========================================================
-# HELPERS
+# DATA HELPERS
 # =========================================================
-def now():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def money(value):
-    return f"₹{float(value):,.2f}"
-
+def now(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def fmt_money(value): return f"₹{float(value):,.2f}"
+def fmt_compact(value):
+    v, sign = abs(float(value)), "-" if float(value) < 0 else ""
+    if v >= 1_00_00_000: return f"{sign}₹{v/1_00_00_000:.2f}Cr"
+    if v >= 1_00_000: return f"{sign}₹{v/1_00_000:.2f}L"
+    if v >= 1_000: return f"{sign}₹{v/1_000:.1f}k"
+    return f"{sign}₹{v:,.0f}"
 
 def execute(sql, params=()):
     conn = get_db()
@@ -89,662 +75,366 @@ def execute(sql, params=()):
     conn.close()
     return last_id
 
-
 def query(sql, params=()):
     conn = get_db()
     df = pd.read_sql_query(sql, conn, params=params)
     conn.close()
     return df
 
-
-def wallet_balance(wallet):
-    """Available money currently in Cash or UPI."""
-    income = query(
-        "SELECT COALESCE(SUM(amount),0) AS n FROM transactions "
-        "WHERE tx_type='Income' AND wallet=?",
-        (wallet,),
-    ).iloc[0]["n"]
-
-    opening = query(
-        "SELECT COALESCE(SUM(amount),0) AS n FROM transactions "
-        "WHERE tx_type='Opening Balance' AND wallet=?",
-        (wallet,),
-    ).iloc[0]["n"]
-
-    expense = query(
-        "SELECT COALESCE(SUM(amount),0) AS n FROM transactions "
-        "WHERE tx_type='Expense' AND wallet=?",
-        (wallet,),
-    ).iloc[0]["n"]
-
-    transfer_in = query(
-        "SELECT COALESCE(SUM(amount),0) AS n FROM transactions "
-        "WHERE tx_type='Transfer' AND to_wallet=?",
-        (wallet,),
-    ).iloc[0]["n"]
-
-    transfer_out = query(
-        "SELECT COALESCE(SUM(amount),0) AS n FROM transactions "
-        "WHERE tx_type='Transfer' AND from_wallet=?",
-        (wallet,),
-    ).iloc[0]["n"]
-
-    given = query(
-        "SELECT COALESCE(SUM(amount),0) AS n FROM transactions "
-        "WHERE tx_type='Money Given' AND wallet=?",
-        (wallet,),
-    ).iloc[0]["n"]
-
-    returned = query(
-        "SELECT COALESCE(SUM(amount),0) AS n FROM transactions "
-        "WHERE tx_type='Money Returned' AND wallet=?",
-        (wallet,),
-    ).iloc[0]["n"]
-
-    fd_created = query(
-        "SELECT COALESCE(SUM(amount),0) AS n FROM transactions "
-        "WHERE tx_type='FD Created' AND wallet=?",
-        (wallet,),
-    ).iloc[0]["n"]
-
-    fd_returned = query(
-        "SELECT COALESCE(SUM(amount),0) AS n FROM transactions "
-        "WHERE tx_type='FD Matured' AND wallet=?",
-        (wallet,),
-    ).iloc[0]["n"]
-    
-    fd_interest = query(
-        "SELECT COALESCE(SUM(amount),0) AS n FROM transactions "
-        "WHERE tx_type='FD Interest Payout' AND wallet=?",
-        (wallet,),
-    ).iloc[0]["n"]
-
-    return float(
-        opening + income - expense
-        + transfer_in - transfer_out
-        - given + returned
-        - fd_created + fd_returned + fd_interest
-    )
-
+def get_balance(wallet):
+    q = "SELECT COALESCE(SUM(amount),0) AS n FROM transactions WHERE tx_type=? AND {}"
+    inc = query(q.format("wallet=?"), ('Income', wallet)).iloc[0]['n']
+    op = query(q.format("wallet=?"), ('Opening Balance', wallet)).iloc[0]['n']
+    exp = query(q.format("wallet=?"), ('Expense', wallet)).iloc[0]['n']
+    t_in = query(q.format("to_wallet=?"), ('Transfer', wallet)).iloc[0]['n']
+    t_out = query(q.format("from_wallet=?"), ('Transfer', wallet)).iloc[0]['n']
+    gvn = query(q.format("wallet=?"), ('Money Given', wallet)).iloc[0]['n']
+    rtn = query(q.format("wallet=?"), ('Money Returned', wallet)).iloc[0]['n']
+    fd_c = query(q.format("wallet=?"), ('FD Created', wallet)).iloc[0]['n']
+    fd_m = query(q.format("wallet=?"), ('FD Matured', wallet)).iloc[0]['n']
+    fd_i = query(q.format("wallet=?"), ('FD Interest Payout', wallet)).iloc[0]['n']
+    return float(op + inc - exp + t_in - t_out - gvn + rtn - fd_c + fd_m + fd_i)
 
 def pending_summary():
     df = query("""
-        SELECT
-            person,
-            SUM(CASE WHEN tx_type='Money Given'
-                     THEN amount ELSE 0 END) AS given,
-            SUM(CASE WHEN tx_type='Money Returned'
-                     THEN amount ELSE 0 END) AS returned
-        FROM transactions
-        WHERE person IS NOT NULL AND TRIM(person) <> ''
-        GROUP BY person
-        ORDER BY person COLLATE NOCASE
+        SELECT person,
+        SUM(CASE WHEN tx_type='Money Given' THEN amount ELSE 0 END) AS given,
+        SUM(CASE WHEN tx_type='Money Returned' THEN amount ELSE 0 END) AS returned
+        FROM transactions WHERE person IS NOT NULL AND TRIM(person) <> '' GROUP BY person
     """)
-    if df.empty:
-        return df
-
-    df["pending"] = (df["given"] - df["returned"]).clip(lower=0)
+    if not df.empty: df["pending"] = (df["given"] - df["returned"]).clip(lower=0)
     return df
 
-
-def active_fd_total():
-    row = query(
-        "SELECT COALESCE(SUM(amount),0) AS n FROM fds WHERE status='Active'"
-    ).iloc[0]
-    return float(row["n"])
-
-
-def total_pending():
-    p = pending_summary()
-    return float(p["pending"].sum()) if not p.empty else 0.0
-
-
-def people():
-    df = query("""
-        SELECT DISTINCT person
-        FROM transactions
-        WHERE person IS NOT NULL AND TRIM(person) <> ''
-        ORDER BY person COLLATE NOCASE
-    """)
-    return df["person"].tolist() if not df.empty else []
-
-
 # =========================================================
-# STYLE (VISUALLY CLEAR IN LIGHT & DARK MODE)
+# MOBILE UI THEME & CSS ENGINE
 # =========================================================
-if "dark" not in st.session_state:
-    st.session_state.dark = False
+DARK_THEME = {
+    "bg": "#000000", "surface": "#121212", "surface2": "#1E1E1E", "text": "#FFFFFF",
+    "subtext": "#A0A0A5", "border": "#2C2C2E", "primary": "#0A84FF",
+    "pos": "#30D158", "neg": "#FF453A", "accent": "#FF9F0A"
+}
+LIGHT_THEME = {
+    "bg": "#F2F2F7", "surface": "#FFFFFF", "surface2": "#F9F9EB", "text": "#1C1C1E",
+    "subtext": "#8E8E93", "border": "#E5E5EA", "primary": "#007AFF",
+    "pos": "#34C759", "neg": "#FF3B30", "accent": "#FF9500"
+}
+T = DARK_THEME if st.session_state.dark_mode else LIGHT_THEME
 
-if st.session_state.dark:
-    bg = "#0b1020"
-    card = "#141c2e"
-    card_border = "rgba(128,145,180,.25)"
-    text = "#f5f7ff"
-    muted = "#aab5ca"
-else:
-    bg = "#f8fafc"
-    card = "#ffffff"
-    card_border = "#cbd5e1"
-    text = "#0f172a"
-    muted = "#475569"
+st.markdown(f"""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+    
+    html, body, [class*="css"] {{ font-family: 'Inter', -apple-system, sans-serif; background-color: {T['bg']}; }}
+    .stApp {{ background-color: {T['bg']}; }}
+    .block-container {{ padding: 1rem 1rem 6rem 1rem !important; max-width: 500px; margin: 0 auto; }}
+    header, footer, #MainMenu {{ display: none !important; }}
 
-st.markdown(
-    f"""
-    <style>
-    .stApp {{ background:{bg}; color:{text}; }}
-    [data-testid="stSidebar"] {{ background:{card}; border-right: 1px solid {card_border}; }}
-    [data-testid="stSidebar"] * {{ color:{text} !important; }}
-    .title {{ font-size:32px; font-weight:800; color:{text}; }}
-    .subtitle {{ color:{muted}; margin-bottom:20px; font-size:15px; }}
-    .card {{
-        background:{card};
-        border:1px solid {card_border};
-        border-radius:14px;
-        padding:20px;
-        margin-bottom:12px;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    /* Mobile App Header */
+    .app-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }}
+    .app-title {{ font-size: 24px; font-weight: 800; color: {T['text']}; letter-spacing: -0.5px; }}
+    
+    /* Main Balance Card (Glassmorphism) */
+    .balance-card {{
+        background: linear-gradient(135deg, {T['surface2']} 0%, {T['surface']} 100%);
+        border: 1px solid {T['border']}; border-radius: 24px; padding: 24px;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.05); margin-bottom: 16px;
     }}
-    [data-testid="stMetricValue"] {{ color: {text} !important; }}
-    [data-testid="stMetricLabel"] {{ color: {muted} !important; font-weight: 600 !important; }}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+    .balance-label {{ font-size: 13px; color: {T['subtext']}; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }}
+    .balance-amount {{ font-size: 42px; font-weight: 800; color: {T['text']}; letter-spacing: -1px; margin: 4px 0 16px 0; }}
+    .wallet-split {{ display: flex; gap: 12px; }}
+    .wallet-pill {{ background: {T['bg']}; border-radius: 12px; padding: 10px 14px; flex: 1; border: 1px solid {T['border']}; }}
+    .wallet-pill-label {{ font-size: 12px; color: {T['subtext']}; font-weight: 500; margin-bottom: 2px; }}
+    .wallet-pill-val {{ font-size: 16px; color: {T['text']}; font-weight: 700; }}
 
+    /* Fintech Style Lists */
+    .list-header {{ font-size: 17px; font-weight: 700; color: {T['text']}; margin: 24px 0 12px 0; }}
+    .tx-container {{ background: {T['surface']}; border-radius: 20px; overflow: hidden; border: 1px solid {T['border']}; }}
+    .tx-row {{ display: flex; align-items: center; padding: 16px; border-bottom: 1px solid {T['border']}; }}
+    .tx-row:last-child {{ border-bottom: none; }}
+    .tx-icon {{ width: 40px; height: 40px; border-radius: 12px; display: flex; justify-content: center; align-items: center; font-size: 18px; margin-right: 14px; background: {T['bg']}; }}
+    .tx-details {{ flex: 1; min-width: 0; }}
+    .tx-title {{ font-size: 15px; font-weight: 600; color: {T['text']}; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+    .tx-sub {{ font-size: 13px; color: {T['subtext']}; margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+    .tx-amt {{ font-size: 16px; font-weight: 700; text-align: right; }}
+    
+    /* Colors */
+    .c-pos {{ color: {T['pos']}; }} .bg-pos {{ background: {T['pos']}20; color: {T['pos']}; }}
+    .c-neg {{ color: {T['text']}; }} .bg-neg {{ background: {T['surface2']}; color: {T['text']}; }}
+    .c-acc {{ color: {T['accent']}; }} .bg-acc {{ background: {T['accent']}20; color: {T['accent']}; }}
+    .c-pri {{ color: {T['primary']}; }} .bg-pri {{ background: {T['primary']}20; color: {T['primary']}; }}
 
-# =========================================================
-# HEADER
-# =========================================================
-top1, top2 = st.columns([7, 1])
-with top1:
-    st.markdown('<div class="title">💰 Cash & UPI Money Manager</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="subtitle">Cash + UPI • Internal Transfers • Pending Money • Monthly FD Interest to UPI</div>',
-        unsafe_allow_html=True,
-    )
-with top2:
-    label = "🌙 Dark" if not st.session_state.dark else "☀️ Light"
-    if st.button(label, use_container_width=True):
-        st.session_state.dark = not st.session_state.dark
+    /* Streamlit overrides for Mobile feel */
+    div[data-testid="stPills"] button {{ border-radius: 12px !important; font-weight: 600 !important; background: {T['surface']} !important; border: 1px solid {T['border']} !important; }}
+    div[data-testid="stPills"] button[aria-selected="true"] {{ background: {T['text']} !important; color: {T['bg']} !important; }}
+    
+    .stTextInput input, .stNumberInput input, .stDateInput input, .stSelectbox div[data-baseweb="select"] {{
+        background-color: {T['surface']} !important; border-radius: 12px !important; border: 1px solid {T['border']} !important; padding: 14px !important; font-size: 16px !important; color: {T['text']} !important;
+    }}
+    .stButton>button {{ border-radius: 16px !important; font-weight: 700 !important; padding: 14px !important; font-size: 16px !important; transition: transform 0.1s; }}
+    .stButton>button:active {{ transform: scale(0.97); }}
+    button[kind="primary"] {{ background-color: {T['primary']} !important; color: white !important; border: none !important; }}
+    
+    /* Empty State */
+    .empty-state {{ text-align: center; padding: 40px 20px; color: {T['subtext']}; background: {T['surface']}; border-radius: 20px; border: 1px dashed {T['border']}; margin-top: 10px; }}
+</style>
+""", unsafe_allow_html=True)
+
+# UI Component Helpers
+TX_STYLES = {
+    "Income": ("↓", "bg-pos", "c-pos", "+"), "Expense": ("↑", "bg-neg", "c-neg", ""),
+    "Transfer": ("⇄", "bg-pri", "c-pri", ""), "Money Given": ("↗", "bg-neg", "c-neg", ""),
+    "Money Returned": ("↙", "bg-pos", "c-pos", "+"), "FD Created": ("🏦", "bg-acc", "c-neg", ""),
+    "FD Matured": ("🏦", "bg-pos", "c-pos", "+"), "FD Interest Payout": ("✦", "bg-pos", "c-pos", "+"),
+    "Opening Balance": ("●", "bg-pri", "c-pri", "")
+}
+
+def render_tx_list(df, empty_msg="No activity yet."):
+    if df.empty:
+        st.markdown(f'<div class="empty-state">📝<br><br>{empty_msg}</div>', unsafe_allow_html=True)
+        return
+    
+    html = '<div class="tx-container">'
+    for _, r in df.iterrows():
+        icon, bg_c, txt_c, sign = TX_STYLES.get(r['Type'], ("•", "bg-neg", "c-neg", ""))
+        
+        # Smart Title & Subtitle logic
+        if r['Type'] == "Transfer": title = f"{r.get('From_Wallet','')} → {r.get('To_Wallet','')}"
+        else: title = " · ".join(filter(None, [r.get('Category'), r.get('Person'), r['Type']]))
+        
+        sub_elements = [r['Date']]
+        if r.get('Wallet') and r['Type'] != "Transfer": sub_elements.append(r['Wallet'])
+        if r.get('Notes') or r.get('Note'): sub_elements.append((r.get('Notes') or r.get('Note')).strip())
+        sub = " • ".join(sub_elements)
+
+        html += f"""
+        <div class="tx-row">
+            <div class="tx-icon {bg_c}">{icon}</div>
+            <div class="tx-details">
+                <div class="tx-title">{title}</div>
+                <div class="tx-sub">{sub}</div>
+            </div>
+            <div class="tx-amt {txt_c}">{sign}{fmt_compact(r['Amount'])}</div>
+        </div>
+        """
+    html += '</div>'
+    st.markdown(html, unsafe_allow_html=True)
+
+def app_header():
+    c1, c2 = st.columns([5,1])
+    with c1: st.markdown('<div class="app-header"><div class="app-title">Vault.</div></div>', unsafe_allow_html=True)
+    with c2: 
+        if st.button("🌓", use_container_width=True):
+            st.session_state.dark_mode = not st.session_state.dark_mode
+            st.rerun()
+
+    # Mobile Router / Navigation Tab
+    tabs = ["Overview", "Transact", "Pending", "FDs", "More"]
+    selected = st.pills("Nav", tabs, default=st.session_state.active_tab, label_visibility="collapsed")
+    if selected and selected != st.session_state.active_tab:
+        st.session_state.active_tab = selected
         st.rerun()
 
-
 # =========================================================
-# NAVIGATION
+# APP SCREENS (Pages)
 # =========================================================
-st.sidebar.title("Menu")
-page = st.sidebar.radio(
-    "Open",
-    [
-        "🏠 Dashboard",
-        "➕ Add Transaction",
-        "⏳ Pending Money",
-        "🏦 Fixed Deposits",
-        "📊 Reports",
-        "📋 History",
-    ],
-)
 
-st.sidebar.divider()
-st.sidebar.caption("Only Cash and UPI are active transaction wallets.")
-st.sidebar.caption("Cash ↔ UPI transfers do not change combined totals.")
+def page_overview():
+    cash, upi = get_balance("Cash"), get_balance("UPI")
+    total = cash + upi
+    fd_total = float(query("SELECT COALESCE(SUM(amount),0) AS n FROM fds WHERE status='Active'").iloc[0]["n"])
+    
+    st.markdown(f"""
+    <div class="balance-card">
+        <div class="balance-label">Total Balance</div>
+        <div class="balance-amount">{fmt_money(total)}</div>
+        <div class="wallet-split">
+            <div class="wallet-pill">
+                <div class="wallet-pill-label">💵 Cash</div>
+                <div class="wallet-pill-val">{fmt_compact(cash)}</div>
+            </div>
+            <div class="wallet-pill">
+                <div class="wallet-pill-label">📱 UPI</div>
+                <div class="wallet-pill-val">{fmt_compact(upi)}</div>
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
+    if fd_total > 0:
+        st.markdown(f"""
+        <div class="wallet-pill" style="margin-bottom:16px; border: 1px solid {T['accent']}40;">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+                <div>
+                    <div class="wallet-pill-label">🏦 Locked in Active FDs</div>
+                    <div class="wallet-pill-val" style="color: {T['accent']}">{fmt_money(fd_total)}</div>
+                </div>
+                <div style="font-size:24px">🔒</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
-# =========================================================
-# DASHBOARD
-# =========================================================
-if page == "🏠 Dashboard":
-    cash = wallet_balance("Cash")
-    upi = wallet_balance("UPI")
-    available = cash + upi
-    pending = total_pending()
-    fd_total = active_fd_total()
+    st.markdown(f'<div class="list-header">Recent Activity</div>', unsafe_allow_html=True)
+    recent = query("SELECT id AS ID, tx_date AS Date, tx_type AS Type, amount AS Amount, wallet AS Wallet, from_wallet AS From_Wallet, to_wallet AS To_Wallet, person AS Person, category AS Category, note AS Note FROM transactions ORDER BY tx_date DESC, id DESC LIMIT 5")
+    render_tx_list(recent, "Your recent transactions will appear here.")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("💵 Cash Total", money(cash))
-    c2.metric("📱 UPI Total", money(upi))
-    c3.metric("💰 Cash + UPI", money(available))
-    c4.metric("⏳ Pending Money", money(pending))
-
-    st.metric("🏦 Active FD Principal", money(fd_total))
-
-    st.markdown("### Overview Breakdown")
-    a, b, c = st.columns(3)
-    with a:
-        st.markdown(
-            f'<div class="card"><b>Cash Wallet</b><br><span style="font-size:20px; font-weight:700;">{money(cash)}</span><br>'
-            f'<small style="color:{muted};">Available physical cash on hand.</small></div>',
-            unsafe_allow_html=True,
-        )
-    with b:
-        st.markdown(
-            f'<div class="card"><b>UPI Wallet</b><br><span style="font-size:20px; font-weight:700;">{money(upi)}</span><br>'
-            f'<small style="color:{muted};">Available digital/UPI bank balance.</small></div>',
-            unsafe_allow_html=True,
-        )
-    with c:
-        st.markdown(
-            f'<div class="card"><b>Pending Outflow</b><br><span style="font-size:20px; font-weight:700;">{money(pending)}</span><br>'
-            f'<small style="color:{muted};">Money given out, awaiting return.</small></div>',
-            unsafe_allow_html=True,
-        )
-
-    st.markdown("### Recent Transactions")
-    recent = query("""
-        SELECT
-            id AS ID, tx_date AS Date, tx_type AS Type, amount AS Amount,
-            wallet AS Wallet, from_wallet AS From_Wallet,
-            to_wallet AS To_Wallet, person AS Person, category AS Category,
-            note AS Note
-        FROM transactions
-        ORDER BY tx_date DESC, id DESC
-        LIMIT 15
-    """)
-    if recent.empty:
-        st.info("No transactions recorded yet.")
-    else:
-        st.dataframe(
-            recent.style.format({"Amount": "₹{:,.2f}"}),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-
-# =========================================================
-# ADD TRANSACTION
-# =========================================================
-elif page == "➕ Add Transaction":
-    st.subheader("➕ Add Transaction")
-
-    tx_type = st.selectbox(
-        "Transaction Type",
-        [
-            "Opening Balance",
-            "Income",
-            "Expense",
-            "Transfer",
-            "Money Given",
-            "Money Returned",
-        ],
-    )
-
-    with st.form("transaction_form", clear_on_submit=True):
-        d = st.date_input("Date", date.today())
-        amount = st.number_input("Amount (₹)", min_value=0.01, step=100.0, format="%.2f")
-
-        wallet = None
-        from_wallet = None
-        to_wallet = None
-        person = ""
-        category = ""
-
+def page_transact():
+    st.markdown(f'<div class="list-header">New Transaction</div>', unsafe_allow_html=True)
+    
+    tx_type = st.pills("Type", ["Expense", "Income", "Transfer", "Lend/Borrow"], default="Expense", label_visibility="collapsed")
+    
+    with st.form("add_tx_form", clear_on_submit=True):
+        amt = st.number_input("Amount (₹)", min_value=0.01, step=500.0, format="%.2f")
+        
+        # Dynamic form fields based on selection
+        col1, col2 = st.columns(2)
+        with col1: d = st.date_input("Date", date.today())
+        
+        from_w = to_w = wallet = cat = person = db_tx_type = None
+        
         if tx_type == "Transfer":
-            from_wallet = st.selectbox("From", ["Cash", "UPI"])
-            to_wallet = st.selectbox("To", ["UPI", "Cash"])
-            if from_wallet == to_wallet:
-                st.warning("From and To must be different.")
-        elif tx_type in ["Opening Balance", "Income", "Expense", "Money Given", "Money Returned"]:
-            wallet = st.selectbox("Wallet", ["Cash", "UPI"])
-
-        if tx_type in ["Money Given", "Money Returned"]:
-            existing_people = people()
-            person_choice = st.selectbox(
-                "Person",
-                ["➕ New person"] + existing_people,
-            )
-            if person_choice == "➕ New person":
-                person = st.text_input("Person Name *")
-            else:
-                person = person_choice
-
-        if tx_type in ["Income", "Expense"]:
-            category = st.text_input("Category", placeholder="Salary, food, shopping, etc.")
-
-        note = st.text_area("Notes / Details")
-
-        save = st.form_submit_button("💾 Save Transaction", type="primary")
-
-    if save:
-        if amount <= 0:
-            st.error("Amount must be greater than zero.")
-        elif tx_type == "Transfer" and from_wallet == to_wallet:
-            st.error("From and To wallets must be different.")
-        elif tx_type in ["Money Given", "Money Returned"] and not person.strip():
-            st.error("Please enter a person name.")
+            db_tx_type = "Transfer"
+            with col2: from_w = st.selectbox("From", ["Cash", "UPI"])
+            to_w = st.selectbox("To", ["UPI", "Cash"])
+        
+        elif tx_type == "Lend/Borrow":
+            direction = st.radio("Action", ["I Gave Money ↗", "I Got Money Back ↙"], horizontal=True, label_visibility="collapsed")
+            db_tx_type = "Money Given" if "Gave" in direction else "Money Returned"
+            with col2: wallet = st.selectbox("Wallet Used", ["UPI", "Cash"])
+            
+            existing = query("SELECT DISTINCT person FROM transactions WHERE person IS NOT NULL AND TRIM(person) <> ''")['person'].tolist()
+            p_sel = st.selectbox("Person", ["➕ New Person"] + existing)
+            person = st.text_input("Name") if p_sel == "➕ New Person" else p_sel
+            
         else:
-            execute(
-                """
-                INSERT INTO transactions
-                (tx_date, tx_type, amount, wallet, from_wallet, to_wallet,
-                 person, category, note, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    d.isoformat(),
-                    tx_type,
-                    float(amount),
-                    wallet,
-                    from_wallet,
-                    to_wallet,
-                    person.strip(),
-                    category.strip(),
-                    note.strip(),
-                    now(),
-                ),
-            )
-            st.success(f"Saved {tx_type}: {money(amount)}")
-            st.rerun()
+            db_tx_type = tx_type
+            with col2: wallet = st.selectbox("Wallet", ["UPI", "Cash"])
+            cat = st.text_input("Category (e.g. Food, Salary)")
+            
+        note = st.text_input("Optional Note")
+        
+        st.markdown("<br>", unsafe_allow_html=True)
+        submitted = st.form_submit_button(f"Confirm {tx_type}", type="primary", use_container_width=True)
+        
+        if submitted:
+            if amt <= 0: st.error("Amount must be positive.")
+            elif tx_type == "Transfer" and from_w == to_w: st.error("Select different wallets.")
+            elif tx_type == "Lend/Borrow" and not person: st.error("Name is required.")
+            else:
+                execute(
+                    "INSERT INTO transactions (tx_date, tx_type, amount, wallet, from_wallet, to_wallet, person, category, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (d.isoformat(), db_tx_type, float(amt), wallet, from_w, to_w, (person or "").strip(), (cat or "").strip(), note.strip(), now())
+                )
+                st.success(f"Recorded ₹{amt:,.0f} successfully!")
+                st.session_state.active_tab = "Overview"
+                st.rerun()
 
-
-# =========================================================
-# PENDING MONEY
-# =========================================================
-elif page == "⏳ Pending Money":
-    st.subheader("⏳ Pending Money Tracker")
-
-    st.write(
-        "Money given to other individuals is tracked here. "
-        "It is separated from your available Cash and UPI balances."
-    )
-
+def page_pending():
+    st.markdown(f'<div class="list-header">IOU & Pending</div>', unsafe_allow_html=True)
     p = pending_summary()
-
-    if p.empty:
-        st.info("No pending money records.")
+    
+    if p.empty or p['pending'].sum() == 0:
+        st.markdown(f'<div class="empty-state">🤝<br><br>All settled up! No pending money.</div>', unsafe_allow_html=True)
     else:
-        display = p.rename(
-            columns={
-                "person": "Person",
-                "given": "Total Given",
-                "returned": "Total Returned",
-                "pending": "Pending",
-            }
-        )
-        st.dataframe(
-            display.style.format(
-                {
-                    "Total Given": "₹{:,.2f}",
-                    "Total Returned": "₹{:,.2f}",
-                    "Pending": "₹{:,.2f}",
-                }
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
+        html = '<div class="tx-container">'
+        for _, r in p[p['pending'] > 0].iterrows():
+            html += f"""
+            <div class="tx-row">
+                <div class="tx-icon bg-neg">👤</div>
+                <div class="tx-details">
+                    <div class="tx-title">{r['person']}</div>
+                    <div class="tx-sub">Given: {fmt_compact(r['given'])} • Got: {fmt_compact(r['returned'])}</div>
+                </div>
+                <div class="tx-amt" style="color:{T['neg']}">-{fmt_compact(r['pending'])}</div>
+            </div>
+            """
+        html += '</div>'
+        st.markdown(html, unsafe_allow_html=True)
+        
+        st.markdown(f'<div class="list-header" style="margin-top:32px;">Person History</div>', unsafe_allow_html=True)
+        person = st.selectbox("Select Person", p["person"].tolist(), label_visibility="collapsed")
+        detail = query("SELECT id AS ID, tx_date AS Date, tx_type AS Type, amount AS Amount, wallet AS Wallet, note AS Notes FROM transactions WHERE person=? ORDER BY tx_date DESC", (person,))
+        render_tx_list(detail)
 
-        st.markdown("### Person Transaction Breakdown")
-        person = st.selectbox("Select person", p["person"].tolist())
-        detail = query("""
-            SELECT
-                id AS ID, tx_date AS Date, tx_type AS Type, amount AS Amount,
-                wallet AS Wallet, note AS Notes
-            FROM transactions
-            WHERE person=?
-            ORDER BY tx_date DESC, id DESC
-        """, (person,))
-        st.dataframe(
-            detail.style.format({"Amount": "₹{:,.2f}"}),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-
-# =========================================================
-# FIXED DEPOSITS (WITH MONTHLY INTEREST TO UPI)
-# =========================================================
-elif page == "🏦 Fixed Deposits":
-    st.subheader("🏦 Fixed Deposits & Monthly UPI Payouts")
-    st.caption("Creating an FD deducts the principal from your UPI balance. Monthly interest payouts deposit directly into your UPI wallet.")
-
-    active = query("""
-        SELECT
-            id AS ID, start_date AS "Start Date", amount AS Amount,
-            interest_rate AS "Interest %", maturity_date AS "Maturity Date",
-            bank_name AS Bank, note AS Notes
-        FROM fds
-        WHERE status='Active'
-        ORDER BY start_date DESC, id DESC
-    """)
-
+def page_fds():
+    st.markdown(f'<div class="list-header">Fixed Deposits Vault</div>', unsafe_allow_html=True)
+    
+    active = query("SELECT id AS ID, start_date AS Date, amount AS Amount, interest_rate AS Rate, maturity_date AS Maturity, bank_name AS Bank, note AS Notes FROM fds WHERE status='Active' ORDER BY start_date DESC")
+    
     if active.empty:
-        st.info("No active Fixed Deposits found.")
+        st.markdown(f'<div class="empty-state">🏦<br><br>No active FDs. Build your savings here.</div>', unsafe_allow_html=True)
     else:
-        st.markdown("### Active Fixed Deposits")
-        st.dataframe(
-            active.style.format({
-                "Amount": "₹{:,.2f}",
-                "Interest %": "{:.2f}%"
-            }),
-            use_container_width=True,
-            hide_index=True,
-        )
+        html = '<div class="tx-container">'
+        for _, r in active.iterrows():
+            html += f"""
+            <div class="tx-row" style="border-left: 4px solid {T['accent']};">
+                <div class="tx-details">
+                    <div class="tx-title" style="font-size: 18px;">{fmt_money(r['Amount'])}</div>
+                    <div class="tx-sub">{r['Bank']} • {r['Rate']}% p.a. • Matures: {r['Maturity']}</div>
+                </div>
+                <div class="tx-amt" style="font-size:12px; font-weight:500; color:{T['subtext']}">ID #{r['ID']}</div>
+            </div>
+            """
+        html += '</div>'
+        st.markdown(html, unsafe_allow_html=True)
 
-    st.markdown("---")
-    col_create, col_payout = st.columns(2)
-
-    with col_create:
-        st.markdown("### ➕ Create New FD")
+    with st.expander("➕ Open New FD", expanded=active.empty):
         with st.form("fd_form", clear_on_submit=True):
-            fd_date = st.date_input("FD Start Date", date.today())
-            fd_amount = st.number_input(
-                "FD Principal Amount (₹)",
-                min_value=0.01,
-                step=1000.0,
-                format="%.2f",
-            )
-            fd_rate = st.number_input(
-                "Annual Interest Rate (%)",
-                min_value=0.0,
-                max_value=100.0,
-                value=6.5,
-                step=0.1,
-            )
-            fd_maturity = st.date_input("Maturity Date", date.today())
-            bank = st.text_input("Bank / Institution Name")
-            fd_note = st.text_area("FD Notes")
-            create_fd = st.form_submit_button("🏦 Create FD from UPI", type="primary")
+            f_amt = st.number_input("Principal (₹)", min_value=100.0, step=5000.0)
+            f_rate = st.number_input("Interest Rate (%)", value=7.0, step=0.1)
+            f_bank = st.text_input("Bank Name")
+            c1, c2 = st.columns(2)
+            with c1: f_start = st.date_input("Start Date")
+            with c2: f_end = st.date_input("Maturity Date")
+            
+            if st.form_submit_button("Lock Funds (from UPI)", type="primary", use_container_width=True):
+                if f_amt > get_balance("UPI"): st.error("Insufficient UPI balance.")
+                else:
+                    execute("INSERT INTO fds (start_date, amount, interest_rate, maturity_date, bank_name, created_at) VALUES (?, ?, ?, ?, ?, ?)", (f_start.isoformat(), float(f_amt), float(f_rate), f_end.isoformat(), f_bank.strip(), now()))
+                    execute("INSERT INTO transactions (tx_date, tx_type, amount, wallet, category, note, created_at) VALUES (?, 'FD Created', ?, 'UPI', 'Vault', ?, ?)", (f_start.isoformat(), float(f_amt), f"FD created at {f_bank}", now()))
+                    st.success("FD Created!")
+                    st.rerun()
 
-        if create_fd:
-            if fd_amount > wallet_balance("UPI"):
-                st.error(
-                    f"Insufficient available UPI balance. Available UPI: {money(wallet_balance('UPI'))}"
-                )
-            elif fd_maturity < fd_date:
-                st.error("Maturity date cannot precede start date.")
-            else:
-                execute(
-                    """
-                    INSERT INTO fds
-                    (start_date, amount, interest_rate, maturity_date, bank_name,
-                     note, status, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, 'Active', ?)
-                    """,
-                    (
-                        fd_date.isoformat(),
-                        float(fd_amount),
-                        float(fd_rate),
-                        fd_maturity.isoformat(),
-                        bank.strip(),
-                        fd_note.strip(),
-                        now(),
-                    ),
-                )
+    if not active.empty:
+        with st.expander("📥 Log Monthly Interest"):
+            with st.form("int_form", clear_on_submit=True):
+                fd_id = st.selectbox("Select FD", active['ID'].tolist(), format_func=lambda x: f"FD #{x} - {active[active['ID']==x].iloc[0]['Bank']}")
+                i_amt = st.number_input("Interest Amount (₹)", min_value=1.0)
+                if st.form_submit_button("Credit Interest to UPI", use_container_width=True):
+                    execute("INSERT INTO transactions (tx_date, tx_type, amount, wallet, category, note, created_at) VALUES (?, 'FD Interest Payout', ?, 'UPI', 'FD Return', ?, ?)", (date.today().isoformat(), float(i_amt), f"Monthly Interest for FD #{fd_id}", now()))
+                    st.success("Interest Credited!")
+                    st.rerun()
+                    
+        with st.expander("↩️ Mature & Close FD"):
+            with st.form("close_form"):
+                fd_id = st.selectbox("Select FD to Close", active['ID'].tolist())
+                ret_amt = st.number_input("Principal Returned (₹)", min_value=1.0, value=float(active[active['ID']==fd_id].iloc[0]['Amount']))
+                if st.form_submit_button("Mature FD (Credit to UPI)", use_container_width=True):
+                    execute("UPDATE fds SET status='Matured' WHERE id=?", (int(fd_id),))
+                    execute("INSERT INTO transactions (tx_date, tx_type, amount, wallet, category, note, created_at) VALUES (?, 'FD Matured', ?, 'UPI', 'Vault', ?, ?)", (date.today().isoformat(), float(ret_amt), f"FD #{fd_id} Matured", now()))
+                    st.success("FD Closed and credited to UPI!")
+                    st.rerun()
 
-                execute(
-                    """
-                    INSERT INTO transactions
-                    (tx_date, tx_type, amount, wallet, category, note, created_at)
-                    VALUES (?, 'FD Created', ?, 'UPI', 'FD', ?, ?)
-                    """,
-                    (
-                        fd_date.isoformat(),
-                        float(fd_amount),
-                        f"FD created from UPI. {fd_note.strip()}".strip(),
-                        now(),
-                    ),
-                )
-                st.success(f"FD successfully created: {money(fd_amount)} deducted from UPI.")
-                st.rerun()
+def page_more():
+    st.markdown(f'<div class="list-header">Complete Ledger</div>', unsafe_allow_html=True)
+    df = query("SELECT id AS ID, tx_date AS Date, tx_type AS Type, amount AS Amount, wallet AS Wallet, from_wallet AS From_Wallet, to_wallet AS To_Wallet, person AS Person, category AS Category, note AS Notes FROM transactions ORDER BY tx_date DESC, id DESC")
+    render_tx_list(df)
 
-    with col_payout:
-        st.markdown("### 💸 Record Monthly Interest (to UPI)")
-        active_ids = active["ID"].tolist() if not active.empty else []
-        if active_ids:
-            with st.form("interest_form", clear_on_submit=True):
-                sel_fd_id = st.selectbox("Select Active FD ID", active_ids)
-                payout_date = st.date_input("Interest Date", date.today())
-                
-                selected_row = active[active["ID"] == sel_fd_id].iloc[0]
-                suggested_monthly_interest = round((selected_row["Amount"] * (selected_row["Interest %"] / 100)) / 12, 2)
-                
-                interest_amount = st.number_input(
-                    "Monthly Interest Amount Received (₹)",
-                    min_value=0.01,
-                    value=float(suggested_monthly_interest),
-                    step=10.0,
-                    format="%.2f",
-                )
-                interest_note = st.text_input("Note (e.g., 'Monthly interest for May')", value="Monthly FD Interest")
-                submit_interest = st.form_submit_button("📥 Credit Interest to UPI", type="primary")
-
-            if submit_interest:
-                execute(
-                    """
-                    INSERT INTO transactions
-                    (tx_date, tx_type, amount, wallet, category, note, created_at)
-                    VALUES (?, 'FD Interest Payout', ?, 'UPI', 'FD Interest', ?, ?)
-                    """,
-                    (
-                        payout_date.isoformat(),
-                        float(interest_amount),
-                        f"FD #{sel_fd_id} monthly interest payout. {interest_note}".strip(),
-                        now(),
-                    ),
-                )
-                st.success(f"Successfully credited {money(interest_amount)} interest to your UPI wallet.")
-                st.rerun()
-        else:
-            st.info("Create an active FD to log monthly interest payouts.")
-
-    st.markdown("---")
-    st.markdown("### ↩️ Mature / Close FD")
-    if active_ids:
-        with st.form("maturity_form"):
-            fd_id = st.selectbox("Select FD ID to Close", active_ids, key="close_fd_select")
-            selected = active[active["ID"] == fd_id].iloc[0]
-            maturity_amount = st.number_input(
-                "Total Principal Returned to UPI (₹)",
-                min_value=0.01,
-                value=float(selected["Amount"]),
-                step=100.0,
-                format="%.2f",
-            )
-            close_fd_btn = st.form_submit_button("↩️ Mature & Return Principal to UPI")
-
-        if close_fd_btn:
-            execute(
-                "UPDATE fds SET status='Matured' WHERE id=?",
-                (int(fd_id),),
-            )
-            execute(
-                """
-                INSERT INTO transactions
-                (tx_date, tx_type, amount, wallet, category, note, created_at)
-                VALUES (?, 'FD Matured', ?, 'UPI', 'FD', ?, ?)
-                """,
-                (
-                    date.today().isoformat(),
-                    float(maturity_amount),
-                    f"FD #{fd_id} matured principal returned.",
-                    now(),
-                ),
-            )
-            st.success("FD marked as Matured and principal returned to UPI wallet.")
-            st.rerun()
-
-
-# =========================================================
-# REPORTS
-# =========================================================
-elif page == "📊 Reports":
-    st.subheader("📊 Financial Reports")
-
-    c1, c2 = st.columns(2)
-    with c1:
-        start = st.date_input("From Date", date.today().replace(day=1))
-    with c2:
-        end = st.date_input("To Date", date.today())
-
-    if start > end:
-        st.error("From date must precede To date.")
-    else:
-        df = query("""
-            SELECT
-                id AS ID, tx_date AS Date, tx_type AS Type, amount AS Amount,
-                wallet AS Wallet, from_wallet AS From_Wallet,
-                to_wallet AS To_Wallet, person AS Person,
-                category AS Category, note AS Notes
-            FROM transactions
-            WHERE tx_date BETWEEN ? AND ?
-            ORDER BY tx_date, id
-        """, (start.isoformat(), end.isoformat()))
-
-        if df.empty:
-            st.info("No transactions found in this date range.")
-        else:
-            st.dataframe(
-                df.style.format({"Amount": "₹{:,.2f}"}),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            st.markdown("### Totals by Transaction Type")
-            totals = df.groupby("Type", as_index=False)["Amount"].sum()
-            st.dataframe(
-                totals.style.format({"Amount": "₹{:,.2f}"}),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-
-# =========================================================
-# HISTORY / DELETE
-# =========================================================
-elif page == "📋 History":
-    st.subheader("📋 Complete Transaction History")
-
-    df = query("""
-        SELECT
-            id AS ID, tx_date AS Date, tx_type AS Type, amount AS Amount,
-            wallet AS Wallet, from_wallet AS From_Wallet,
-            to_wallet AS To_Wallet, person AS Person,
-            category AS Category, due_date AS "Due Date", note AS Notes
-        FROM transactions
-        ORDER BY tx_date DESC, id DESC
-    """)
-
-    if df.empty:
-        st.info("No transactions recorded yet.")
-    else:
-        st.dataframe(
-            df.style.format({"Amount": "₹{:,.2f}"}),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        st.divider()
-        st.markdown("### Delete Transaction")
-
-        tx_id = st.number_input("Transaction ID to Delete", min_value=1, step=1)
-
-        if st.button("🗑️ Delete Transaction"):
-            exists = query(
-                "SELECT id FROM transactions WHERE id=?",
-                (int(tx_id),),
-            )
-            if exists.empty:
-                st.error("Transaction ID not found.")
-            else:
+    st.markdown(f'<div class="list-header" style="margin-top:32px;">Danger Zone</div>', unsafe_allow_html=True)
+    if not df.empty:
+        with st.expander("🗑️ Delete a Transaction"):
+            tx_id = st.selectbox("Select ID to Delete", df["ID"].tolist(), format_func=lambda i: f"#{i} — {df.loc[df['ID']==i,'Type'].values[0]} — {fmt_money(df.loc[df['ID']==i,'Amount'].values[0])}")
+            if st.button("Delete Permanently", use_container_width=True):
                 execute("DELETE FROM transactions WHERE id=?", (int(tx_id),))
-                st.success(f"Transaction #{int(tx_id)} successfully deleted.")
+                st.success("Deleted.")
                 st.rerun()
+
+# =========================================================
+# APP ROUTER
+# =========================================================
+app_header()
+
+if st.session_state.active_tab == "Overview": page_overview()
+elif st.session_state.active_tab == "Transact": page_transact()
+elif st.session_state.active_tab == "Pending": page_pending()
+elif st.session_state.active_tab == "FDs": page_fds()
+elif st.session_state.active_tab == "More": page_more()
