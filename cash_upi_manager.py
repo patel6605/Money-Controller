@@ -1,440 +1,878 @@
-import sqlite3
-from datetime import date, datetime
-from pathlib import Path
-
-import pandas as pd
+# streamlit_app.py
 import streamlit as st
+import io
+import zipfile
+from datetime import datetime
 
-# =========================================================
-# APP CONFIG & INITIALIZATION
-# =========================================================
-st.set_page_config(
-    page_title="Vault | Mobile Money",
-    page_icon="🏦",
-    layout="centered",
-    initial_sidebar_state="collapsed",
+st.set_page_config(page_title="Cash & UPI Money Manager - Project Export", layout="wide")
+
+st.title("Cash & UPI Money Manager — Project ZIP generator")
+st.markdown(
+    """
+This Streamlit app packages a runnable Android project skeleton (Kotlin + Compose + Room + MVVM)
+for the "Cash & UPI Money Manager" you requested. Click the button below to generate a zip
+you can import into Android Studio.
+
+Notes:
+- After download, open the project in Android Studio (preferably Arctic Fox or newer).
+- Ensure Kotlin, AGP and Compose versions match the build.gradle in your environment.
+- This is a starter skeleton; add resources, icons, and adjust versions as needed.
+"""
 )
 
-BASE_DIR = Path(__file__).resolve().parent
-DB_FILE = BASE_DIR / "cash_upi_money_manager.db"
-
-if "dark_mode" not in st.session_state:
-    st.session_state.dark_mode = True 
-if "active_tab" not in st.session_state:
-    st.session_state.active_tab = "Home"
-
-
-# =========================================================
-# DATABASE (Core Logic Retained)
-# =========================================================
-def get_db():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def init_db():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, tx_date TEXT NOT NULL, tx_type TEXT NOT NULL,
-            amount REAL NOT NULL CHECK(amount > 0), wallet TEXT, from_wallet TEXT, to_wallet TEXT,
-            person TEXT, category TEXT, due_date TEXT, note TEXT DEFAULT '', created_at TEXT NOT NULL
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS fds (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, start_date TEXT NOT NULL, amount REAL NOT NULL CHECK(amount > 0),
-            interest_rate REAL DEFAULT 0, maturity_date TEXT, bank_name TEXT DEFAULT '',
-            note TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'Active', created_at TEXT NOT NULL
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-init_db()
-
-# =========================================================
-# DATA HELPERS
-# =========================================================
-def now(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-def fmt_money(value): return f"₹{float(value):,.2f}"
-def fmt_compact(value):
-    v, sign = abs(float(value)), "-" if float(value) < 0 else ""
-    if v >= 1_00_00_000: return f"{sign}₹{v/1_00_00_000:.2f}Cr"
-    if v >= 1_00_000: return f"{sign}₹{v/1_00_000:.2f}L"
-    if v >= 1_000: return f"{sign}₹{v/1_000:.1f}k"
-    return f"{sign}₹{v:,.0f}"
-
-def execute(sql, params=()):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(sql, params)
-    conn.commit()
-    last_id = cur.lastrowid
-    conn.close()
-    return last_id
-
-def query(sql, params=()):
-    conn = get_db()
-    df = pd.read_sql_query(sql, conn, params=params)
-    conn.close()
-    return df
-
-def get_balance(wallet):
-    q = "SELECT COALESCE(SUM(amount),0) AS n FROM transactions WHERE tx_type=? AND {}"
-    inc = query(q.format("wallet=?"), ('Income', wallet)).iloc[0]['n']
-    op = query(q.format("wallet=?"), ('Opening Balance', wallet)).iloc[0]['n']
-    exp = query(q.format("wallet=?"), ('Expense', wallet)).iloc[0]['n']
-    t_in = query(q.format("to_wallet=?"), ('Transfer', wallet)).iloc[0]['n']
-    t_out = query(q.format("from_wallet=?"), ('Transfer', wallet)).iloc[0]['n']
-    gvn = query(q.format("wallet=?"), ('Money Given', wallet)).iloc[0]['n']
-    rtn = query(q.format("wallet=?"), ('Money Returned', wallet)).iloc[0]['n']
-    fd_c = query(q.format("wallet=?"), ('FD Created', wallet)).iloc[0]['n']
-    fd_m = query(q.format("wallet=?"), ('FD Matured', wallet)).iloc[0]['n']
-    fd_i = query(q.format("wallet=?"), ('FD Interest Payout', wallet)).iloc[0]['n']
-    return float(op + inc - exp + t_in - t_out - gvn + rtn - fd_c + fd_m + fd_i)
-
-def pending_summary():
-    df = query("""
-        SELECT person,
-        SUM(CASE WHEN tx_type='Money Given' THEN amount ELSE 0 END) AS given,
-        SUM(CASE WHEN tx_type='Money Returned' THEN amount ELSE 0 END) AS returned
-        FROM transactions WHERE person IS NOT NULL AND TRIM(person) <> '' GROUP BY person
-    """)
-    if not df.empty: df["pending"] = (df["given"] - df["returned"]).clip(lower=0)
-    return df
-
-# =========================================================
-# MOBILE UI THEME & CSS ENGINE
-# =========================================================
-DARK_THEME = {
-    "bg": "#000000", "surface": "#121212", "surface2": "#1E1E1E", "text": "#FFFFFF",
-    "subtext": "#A0A0A5", "border": "#2C2C2E", "primary": "#0A84FF",
-    "pos": "#30D158", "neg": "#FF453A", "accent": "#FF9F0A"
-}
-LIGHT_THEME = {
-    "bg": "#F2F2F7", "surface": "#FFFFFF", "surface2": "#F9F9EB", "text": "#1C1C1E",
-    "subtext": "#8E8E93", "border": "#E5E5EA", "primary": "#007AFF",
-    "pos": "#34C759", "neg": "#FF3B30", "accent": "#FF9500"
-}
-T = DARK_THEME if st.session_state.dark_mode else LIGHT_THEME
-
-st.markdown(f"""
-<style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
-    
-    html, body, [class*="css"] {{ font-family: 'Inter', -apple-system, sans-serif; background-color: {T['bg']}; }}
-    .stApp {{ background-color: {T['bg']}; }}
-    .block-container {{ padding: 1rem 1rem 6rem 1rem !important; max-width: 500px; margin: 0 auto; }}
-    header, footer, #MainMenu {{ display: none !important; }}
-
-    /* Mobile App Header */
-    .app-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }}
-    .app-title {{ font-size: 24px; font-weight: 800; color: {T['text']}; letter-spacing: -0.5px; }}
-    
-    /* Main Balance Card (Glassmorphism) */
-    .balance-card {{
-        background: linear-gradient(135deg, {T['surface2']} 0%, {T['surface']} 100%);
-        border: 1px solid {T['border']}; border-radius: 24px; padding: 24px;
-        box-shadow: 0 10px 30px rgba(0,0,0,0.05); margin-bottom: 16px;
-    }}
-    .balance-label {{ font-size: 13px; color: {T['subtext']}; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }}
-    .balance-amount {{ font-size: 42px; font-weight: 800; color: {T['text']}; letter-spacing: -1px; margin: 4px 0 16px 0; }}
-    .wallet-split {{ display: flex; gap: 12px; }}
-    .wallet-pill {{ background: {T['bg']}; border-radius: 12px; padding: 10px 14px; flex: 1; border: 1px solid {T['border']}; }}
-    .wallet-pill-label {{ font-size: 12px; color: {T['subtext']}; font-weight: 500; margin-bottom: 2px; }}
-    .wallet-pill-val {{ font-size: 16px; color: {T['text']}; font-weight: 700; }}
-
-    /* Fintech Style Lists */
-    .list-header {{ font-size: 17px; font-weight: 700; color: {T['text']}; margin: 24px 0 12px 0; }}
-    .tx-container {{ background: {T['surface']}; border-radius: 20px; overflow: hidden; border: 1px solid {T['border']}; }}
-    .tx-row {{ display: flex; align-items: center; padding: 16px; border-bottom: 1px solid {T['border']}; }}
-    .tx-row:last-child {{ border-bottom: none; }}
-    .tx-icon {{ width: 40px; height: 40px; border-radius: 12px; display: flex; justify-content: center; align-items: center; font-size: 18px; margin-right: 14px; background: {T['bg']}; }}
-    .tx-details {{ flex: 1; min-width: 0; }}
-    .tx-title {{ font-size: 15px; font-weight: 600; color: {T['text']}; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
-    .tx-sub {{ font-size: 13px; color: {T['subtext']}; margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
-    .tx-amt {{ font-size: 16px; font-weight: 700; text-align: right; }}
-    
-    /* Colors */
-    .c-pos {{ color: {T['pos']}; }} .bg-pos {{ background: {T['pos']}20; color: {T['pos']}; }}
-    .c-neg {{ color: {T['text']}; }} .bg-neg {{ background: {T['surface2']}; color: {T['text']}; }}
-    .c-acc {{ color: {T['accent']}; }} .bg-acc {{ background: {T['accent']}20; color: {T['accent']}; }}
-    .c-pri {{ color: {T['primary']}; }} .bg-pri {{ background: {T['primary']}20; color: {T['primary']}; }}
-
-    /* Streamlit overrides for Mobile feel */
-    div[data-testid="stPills"] button {{ border-radius: 12px !important; font-weight: 600 !important; background: {T['surface']} !important; border: 1px solid {T['border']} !important; }}
-    div[data-testid="stPills"] button[aria-selected="true"] {{ background: {T['text']} !important; color: {T['bg']} !important; }}
-    
-    .stTextInput input, .stNumberInput input, .stDateInput input, .stSelectbox div[data-baseweb="select"] {{
-        background-color: {T['surface']} !important; border-radius: 12px !important; border: 1px solid {T['border']} !important; padding: 14px !important; font-size: 16px !important; color: {T['text']} !important;
-    }}
-    .stButton>button {{ border-radius: 16px !important; font-weight: 700 !important; padding: 14px !important; font-size: 16px !important; transition: transform 0.1s; }}
-    .stButton>button:active {{ transform: scale(0.97); }}
-    button[kind="primary"] {{ background-color: {T['primary']} !important; color: white !important; border: none !important; }}
-    
-    /* Empty State */
-    .empty-state {{ text-align: center; padding: 40px 20px; color: {T['subtext']}; background: {T['surface']}; border-radius: 20px; border: 1px dashed {T['border']}; margin-top: 10px; }}
-</style>
-""", unsafe_allow_html=True)
-
-# UI Component Helpers
-TX_STYLES = {
-    "Income": ("↓", "bg-pos", "c-pos", "+"), "Expense": ("↑", "bg-neg", "c-neg", ""),
-    "Transfer": ("⇄", "bg-pri", "c-pri", ""), "Money Given": ("↗", "bg-neg", "c-neg", ""),
-    "Money Returned": ("↙", "bg-pos", "c-pos", "+"), "FD Created": ("🏦", "bg-acc", "c-neg", ""),
-    "FD Matured": ("🏦", "bg-pos", "c-pos", "+"), "FD Interest Payout": ("✦", "bg-pos", "c-pos", "+"),
-    "Opening Balance": ("●", "bg-pri", "c-pri", "")
+# Map of filepath -> content
+files = {
+    "app/build.gradle": """
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+    id 'kotlin-kapt'
 }
 
-def render_tx_list(df, empty_msg="No activity yet."):
-    if df.empty:
-        st.markdown(f'<div class="empty-state">📝<br><br>{empty_msg}</div>', unsafe_allow_html=True)
-        return
-    
-    html = '<div class="tx-container">'
-    for _, r in df.iterrows():
-        icon, bg_c, txt_c, sign = TX_STYLES.get(r['Type'], ("•", "bg-neg", "c-neg", ""))
-        
-        # Smart Title & Subtitle logic
-        if r['Type'] == "Transfer": title = f"{r.get('From_Wallet','')} → {r.get('To_Wallet','')}"
-        else: title = " · ".join(filter(None, [r.get('Category'), r.get('Person'), r['Type']]))
-        
-        sub_elements = [r['Date']]
-        if r.get('Wallet') and r['Type'] != "Transfer": sub_elements.append(r['Wallet'])
-        if r.get('Notes') or r.get('Note'): sub_elements.append((r.get('Notes') or r.get('Note')).strip())
-        sub = " • ".join(sub_elements)
+android {
+    namespace 'com.example.cashupi'
+    compileSdk 34
 
-        html += f"""
-        <div class="tx-row">
-            <div class="tx-icon {bg_c}">{icon}</div>
-            <div class="tx-details">
-                <div class="tx-title">{title}</div>
-                <div class="tx-sub">{sub}</div>
-            </div>
-            <div class="tx-amt {txt_c}">{sign}{fmt_compact(r['Amount'])}</div>
-        </div>
-        """
-    html += '</div>'
-    st.markdown(html, unsafe_allow_html=True)
+    defaultConfig {
+        applicationId "com.example.cashupi"
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
 
-def app_header():
-    c1, c2 = st.columns([5,1])
-    with c1: st.markdown('<div class="app-header"><div class="app-title">Vault.</div></div>', unsafe_allow_html=True)
-    with c2: 
-        if st.button("🌓", use_container_width=True):
-            st.session_state.dark_mode = not st.session_state.dark_mode
-            st.rerun()
+    buildFeatures {
+        compose true
+    }
 
-    # Mobile Router / Navigation Tab
-    tabs = ["Overview", "Transact", "Pending", "FDs", "More"]
-    selected = st.pills("Nav", tabs, default=st.session_state.active_tab, label_visibility="collapsed")
-    if selected and selected != st.session_state.active_tab:
-        st.session_state.active_tab = selected
-        st.rerun()
+    composeOptions {
+        kotlinCompilerExtensionVersion '1.5.4'
+    }
 
-# =========================================================
-# APP SCREENS (Pages)
-# =========================================================
+    kotlinOptions {
+        jvmTarget = '17'
+    }
 
-def page_overview():
-    cash, upi = get_balance("Cash"), get_balance("UPI")
-    total = cash + upi
-    fd_total = float(query("SELECT COALESCE(SUM(amount),0) AS n FROM fds WHERE status='Active'").iloc[0]["n"])
-    
-    st.markdown(f"""
-    <div class="balance-card">
-        <div class="balance-label">Total Balance</div>
-        <div class="balance-amount">{fmt_money(total)}</div>
-        <div class="wallet-split">
-            <div class="wallet-pill">
-                <div class="wallet-pill-label">💵 Cash</div>
-                <div class="wallet-pill-val">{fmt_compact(cash)}</div>
-            </div>
-            <div class="wallet-pill">
-                <div class="wallet-pill-label">📱 UPI</div>
-                <div class="wallet-pill-val">{fmt_compact(upi)}</div>
-            </div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+    packagingOptions {
+        resources {
+            excludes += '/META-INF/{AL2.0,LGPL2.1}'
+        }
+    }
+}
 
-    if fd_total > 0:
-        st.markdown(f"""
-        <div class="wallet-pill" style="margin-bottom:16px; border: 1px solid {T['accent']}40;">
-            <div style="display:flex; justify-content:space-between; align-items:center;">
-                <div>
-                    <div class="wallet-pill-label">🏦 Locked in Active FDs</div>
-                    <div class="wallet-pill-val" style="color: {T['accent']}">{fmt_money(fd_total)}</div>
-                </div>
-                <div style="font-size:24px">🔒</div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+dependencies {
+    implementation "androidx.core:core-ktx:1.12.0"
+    implementation "androidx.activity:activity-compose:1.8.0"
+    implementation "androidx.compose.ui:ui:1.4.8"
+    implementation "androidx.compose.material:material:1.4.3"
+    implementation "androidx.compose.material3:material3:1.2.0-alpha02"
+    implementation "androidx.compose.ui:ui-tooling-preview:1.4.8"
+    debugImplementation "androidx.compose.ui:ui-tooling:1.4.8"
 
-    st.markdown(f'<div class="list-header">Recent Activity</div>', unsafe_allow_html=True)
-    recent = query("SELECT id AS ID, tx_date AS Date, tx_type AS Type, amount AS Amount, wallet AS Wallet, from_wallet AS From_Wallet, to_wallet AS To_Wallet, person AS Person, category AS Category, note AS Note FROM transactions ORDER BY tx_date DESC, id DESC LIMIT 5")
-    render_tx_list(recent, "Your recent transactions will appear here.")
+    implementation "androidx.navigation:navigation-compose:2.7.0"
+    implementation "androidx.lifecycle:lifecycle-runtime-ktx:2.6.2"
+    implementation "androidx.lifecycle:lifecycle-viewmodel-compose:2.6.2"
 
-def page_transact():
-    st.markdown(f'<div class="list-header">New Transaction</div>', unsafe_allow_html=True)
-    
-    tx_type = st.pills("Type", ["Expense", "Income", "Transfer", "Lend/Borrow"], default="Expense", label_visibility="collapsed")
-    
-    with st.form("add_tx_form", clear_on_submit=True):
-        amt = st.number_input("Amount (₹)", min_value=0.01, step=500.0, format="%.2f")
-        
-        # Dynamic form fields based on selection
-        col1, col2 = st.columns(2)
-        with col1: d = st.date_input("Date", date.today())
-        
-        from_w = to_w = wallet = cat = person = db_tx_type = None
-        
-        if tx_type == "Transfer":
-            db_tx_type = "Transfer"
-            with col2: from_w = st.selectbox("From", ["Cash", "UPI"])
-            to_w = st.selectbox("To", ["UPI", "Cash"])
-        
-        elif tx_type == "Lend/Borrow":
-            direction = st.radio("Action", ["I Gave Money ↗", "I Got Money Back ↙"], horizontal=True, label_visibility="collapsed")
-            db_tx_type = "Money Given" if "Gave" in direction else "Money Returned"
-            with col2: wallet = st.selectbox("Wallet Used", ["UPI", "Cash"])
-            
-            existing = query("SELECT DISTINCT person FROM transactions WHERE person IS NOT NULL AND TRIM(person) <> ''")['person'].tolist()
-            p_sel = st.selectbox("Person", ["➕ New Person"] + existing)
-            person = st.text_input("Name") if p_sel == "➕ New Person" else p_sel
-            
-        else:
-            db_tx_type = tx_type
-            with col2: wallet = st.selectbox("Wallet", ["UPI", "Cash"])
-            cat = st.text_input("Category (e.g. Food, Salary)")
-            
-        note = st.text_input("Optional Note")
-        
-        st.markdown("<br>", unsafe_allow_html=True)
-        submitted = st.form_submit_button(f"Confirm {tx_type}", type="primary", use_container_width=True)
-        
-        if submitted:
-            if amt <= 0: st.error("Amount must be positive.")
-            elif tx_type == "Transfer" and from_w == to_w: st.error("Select different wallets.")
-            elif tx_type == "Lend/Borrow" and not person: st.error("Name is required.")
-            else:
-                execute(
-                    "INSERT INTO transactions (tx_date, tx_type, amount, wallet, from_wallet, to_wallet, person, category, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (d.isoformat(), db_tx_type, float(amt), wallet, from_w, to_w, (person or "").strip(), (cat or "").strip(), note.strip(), now())
-                )
-                st.success(f"Recorded ₹{amt:,.0f} successfully!")
-                st.session_state.active_tab = "Overview"
-                st.rerun()
+    implementation "androidx.room:room-runtime:2.6.0"
+    kapt "androidx.room:room-compiler:2.6.0"
+    implementation "androidx.room:room-ktx:2.6.0"
 
-def page_pending():
-    st.markdown(f'<div class="list-header">IOU & Pending</div>', unsafe_allow_html=True)
-    p = pending_summary()
-    
-    if p.empty or p['pending'].sum() == 0:
-        st.markdown(f'<div class="empty-state">🤝<br><br>All settled up! No pending money.</div>', unsafe_allow_html=True)
-    else:
-        html = '<div class="tx-container">'
-        for _, r in p[p['pending'] > 0].iterrows():
-            html += f"""
-            <div class="tx-row">
-                <div class="tx-icon bg-neg">👤</div>
-                <div class="tx-details">
-                    <div class="tx-title">{r['person']}</div>
-                    <div class="tx-sub">Given: {fmt_compact(r['given'])} • Got: {fmt_compact(r['returned'])}</div>
-                </div>
-                <div class="tx-amt" style="color:{T['neg']}">-{fmt_compact(r['pending'])}</div>
-            </div>
-            """
-        html += '</div>'
-        st.markdown(html, unsafe_allow_html=True)
-        
-        st.markdown(f'<div class="list-header" style="margin-top:32px;">Person History</div>', unsafe_allow_html=True)
-        person = st.selectbox("Select Person", p["person"].tolist(), label_visibility="collapsed")
-        detail = query("SELECT id AS ID, tx_date AS Date, tx_type AS Type, amount AS Amount, wallet AS Wallet, note AS Notes FROM transactions WHERE person=? ORDER BY tx_date DESC", (person,))
-        render_tx_list(detail)
+    implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3"
+    implementation "org.jetbrains.kotlin:kotlin-stdlib:1.9.10"
 
-def page_fds():
-    st.markdown(f'<div class="list-header">Fixed Deposits Vault</div>', unsafe_allow_html=True)
-    
-    active = query("SELECT id AS ID, start_date AS Date, amount AS Amount, interest_rate AS Rate, maturity_date AS Maturity, bank_name AS Bank, note AS Notes FROM fds WHERE status='Active' ORDER BY start_date DESC")
-    
-    if active.empty:
-        st.markdown(f'<div class="empty-state">🏦<br><br>No active FDs. Build your savings here.</div>', unsafe_allow_html=True)
-    else:
-        html = '<div class="tx-container">'
-        for _, r in active.iterrows():
-            html += f"""
-            <div class="tx-row" style="border-left: 4px solid {T['accent']};">
-                <div class="tx-details">
-                    <div class="tx-title" style="font-size: 18px;">{fmt_money(r['Amount'])}</div>
-                    <div class="tx-sub">{r['Bank']} • {r['Rate']}% p.a. • Matures: {r['Maturity']}</div>
-                </div>
-                <div class="tx-amt" style="font-size:12px; font-weight:500; color:{T['subtext']}">ID #{r['ID']}</div>
-            </div>
-            """
-        html += '</div>'
-        st.markdown(html, unsafe_allow_html=True)
+    implementation "androidx.compose.material:material-icons-extended:1.4.3"
+}
+""",
+    "settings.gradle": """
+rootProject.name = "CashUpi"
+include ':app'
+""",
+    "app/src/main/AndroidManifest.xml": """
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.cashupi">
 
-    with st.expander("➕ Open New FD", expanded=active.empty):
-        with st.form("fd_form", clear_on_submit=True):
-            f_amt = st.number_input("Principal (₹)", min_value=100.0, step=5000.0)
-            f_rate = st.number_input("Interest Rate (%)", value=7.0, step=0.1)
-            f_bank = st.text_input("Bank Name")
-            c1, c2 = st.columns(2)
-            with c1: f_start = st.date_input("Start Date")
-            with c2: f_end = st.date_input("Maturity Date")
-            
-            if st.form_submit_button("Lock Funds (from UPI)", type="primary", use_container_width=True):
-                if f_amt > get_balance("UPI"): st.error("Insufficient UPI balance.")
-                else:
-                    execute("INSERT INTO fds (start_date, amount, interest_rate, maturity_date, bank_name, created_at) VALUES (?, ?, ?, ?, ?, ?)", (f_start.isoformat(), float(f_amt), float(f_rate), f_end.isoformat(), f_bank.strip(), now()))
-                    execute("INSERT INTO transactions (tx_date, tx_type, amount, wallet, category, note, created_at) VALUES (?, 'FD Created', ?, 'UPI', 'Vault', ?, ?)", (f_start.isoformat(), float(f_amt), f"FD created at {f_bank}", now()))
-                    st.success("FD Created!")
-                    st.rerun()
+    <application
+        android:allowBackup="true"
+        android:label="Cash & UPI Money Manager"
+        android:theme="@style/Theme.CashUpi">
+        <activity android:name="com.example.cashupi.ui.MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
 
-    if not active.empty:
-        with st.expander("📥 Log Monthly Interest"):
-            with st.form("int_form", clear_on_submit=True):
-                fd_id = st.selectbox("Select FD", active['ID'].tolist(), format_func=lambda x: f"FD #{x} - {active[active['ID']==x].iloc[0]['Bank']}")
-                i_amt = st.number_input("Interest Amount (₹)", min_value=1.0)
-                if st.form_submit_button("Credit Interest to UPI", use_container_width=True):
-                    execute("INSERT INTO transactions (tx_date, tx_type, amount, wallet, category, note, created_at) VALUES (?, 'FD Interest Payout', ?, 'UPI', 'FD Return', ?, ?)", (date.today().isoformat(), float(i_amt), f"Monthly Interest for FD #{fd_id}", now()))
-                    st.success("Interest Credited!")
-                    st.rerun()
-                    
-        with st.expander("↩️ Mature & Close FD"):
-            with st.form("close_form"):
-                fd_id = st.selectbox("Select FD to Close", active['ID'].tolist())
-                ret_amt = st.number_input("Principal Returned (₹)", min_value=1.0, value=float(active[active['ID']==fd_id].iloc[0]['Amount']))
-                if st.form_submit_button("Mature FD (Credit to UPI)", use_container_width=True):
-                    execute("UPDATE fds SET status='Matured' WHERE id=?", (int(fd_id),))
-                    execute("INSERT INTO transactions (tx_date, tx_type, amount, wallet, category, note, created_at) VALUES (?, 'FD Matured', ?, 'UPI', 'Vault', ?, ?)", (date.today().isoformat(), float(ret_amt), f"FD #{fd_id} Matured", now()))
-                    st.success("FD Closed and credited to UPI!")
-                    st.rerun()
+</manifest>
+""",
+    # Kotlin sources
+    "app/src/main/java/com/example/cashupi/data/TransactionEntity.kt": """
+package com.example.cashupi.data
 
-def page_more():
-    st.markdown(f'<div class="list-header">Complete Ledger</div>', unsafe_allow_html=True)
-    df = query("SELECT id AS ID, tx_date AS Date, tx_type AS Type, amount AS Amount, wallet AS Wallet, from_wallet AS From_Wallet, to_wallet AS To_Wallet, person AS Person, category AS Category, note AS Notes FROM transactions ORDER BY tx_date DESC, id DESC")
-    render_tx_list(df)
+import androidx.room.Entity
+import androidx.room.PrimaryKey
 
-    st.markdown(f'<div class="list-header" style="margin-top:32px;">Danger Zone</div>', unsafe_allow_html=True)
-    if not df.empty:
-        with st.expander("🗑️ Delete a Transaction"):
-            tx_id = st.selectbox("Select ID to Delete", df["ID"].tolist(), format_func=lambda i: f"#{i} — {df.loc[df['ID']==i,'Type'].values[0]} — {fmt_money(df.loc[df['ID']==i,'Amount'].values[0])}")
-            if st.button("Delete Permanently", use_container_width=True):
-                execute("DELETE FROM transactions WHERE id=?", (int(tx_id),))
-                st.success("Deleted.")
-                st.rerun()
+@Entity(tableName = "transactions")
+data class TransactionEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val date: Long,
+    val type: String,
+    val amount: Double,
+    val wallet: String?,
+    val fromWallet: String?,
+    val toWallet: String?,
+    val person: String?,
+    val category: String?,
+    val note: String?
+)
+""",
+    "app/src/main/java/com/example/cashupi/data/FDEntity.kt": """
+package com.example.cashupi.data
 
-# =========================================================
-# APP ROUTER
-# =========================================================
-app_header()
+import androidx.room.Entity
+import androidx.room.PrimaryKey
 
-if st.session_state.active_tab == "Overview": page_overview()
-elif st.session_state.active_tab == "Transact": page_transact()
-elif st.session_state.active_tab == "Pending": page_pending()
-elif st.session_state.active_tab == "FDs": page_fds()
-elif st.session_state.active_tab == "More": page_more()
+@Entity(tableName = "fds")
+data class FDEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val startDate: Long,
+    val amount: Double,
+    val interestRate: Double,
+    val maturityDate: Long,
+    val bankName: String?,
+    val note: String?,
+    val status: String
+)
+""",
+    "app/src/main/java/com/example/cashupi/data/PersonPending.kt": """
+package com.example.cashupi.data
+
+data class PersonPending(
+    val person: String,
+    val given: Double,
+    val returned: Double,
+    val pending: Double
+)
+""",
+    "app/src/main/java/com/example/cashupi/data/AppDao.kt": """
+package com.example.cashupi.data
+
+import androidx.room.*
+import kotlinx.coroutines.flow.Flow
+
+@Dao
+interface AppDao {
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertTransaction(tx: TransactionEntity): Long
+
+    @Delete
+    suspend fun deleteTransaction(tx: TransactionEntity)
+
+    @Query("SELECT * FROM transactions ORDER BY date DESC LIMIT :limit")
+    fun recentTransactions(limit: Int = 5): Flow<List<TransactionEntity>>
+
+    @Query("SELECT * FROM transactions ORDER BY date DESC")
+    fun allTransactions(): Flow<List<TransactionEntity>>
+
+    @Query(\"\"\"
+        SELECT COALESCE(SUM(
+            CASE
+                WHEN type IN ('Income','Transfer In','Money Returned','FD Matured','FD Interest Payout') THEN amount
+                WHEN type IN ('Expense','Transfer Out','Money Given','FD Created') THEN -amount
+                ELSE 0
+            END
+        ), 0.0) FROM transactions WHERE wallet = :wallet
+    \"\"\")
+    fun walletBalanceFlow(wallet: String): Flow<Double>
+
+    @Query(\"\"\"
+        SELECT 
+          COALESCE(SUM(
+            CASE
+              WHEN type IN ('Income','Transfer In','Money Returned','FD Matured','FD Interest Payout') THEN amount
+              WHEN type IN ('Expense','Transfer Out','Money Given','FD Created') THEN -amount
+              ELSE 0
+            END
+          ), 0.0) 
+        FROM transactions 
+        WHERE wallet IN (:wallets)
+    \"\"\")
+    fun walletsBalanceFlow(wallets: List<String>): Flow<Double>
+
+    @Query(\"\"\"
+        SELECT 
+            person as person,
+            COALESCE(SUM(CASE WHEN type = 'Money Given' THEN amount ELSE 0 END), 0.0) as given,
+            COALESCE(SUM(CASE WHEN type = 'Money Returned' THEN amount ELSE 0 END), 0.0) as returned,
+            (COALESCE(SUM(CASE WHEN type = 'Money Given' THEN amount ELSE 0 END), 0.0)
+             - COALESCE(SUM(CASE WHEN type = 'Money Returned' THEN amount ELSE 0 END), 0.0)) as pending
+        FROM transactions
+        WHERE person IS NOT NULL AND person != ''
+        GROUP BY person
+        HAVING (COALESCE(SUM(CASE WHEN type = 'Money Given' THEN amount ELSE 0 END), 0.0)
+             - COALESCE(SUM(CASE WHEN type = 'Money Returned' THEN amount ELSE 0 END), 0.0)) > 0
+    \"\"\")
+    fun pendingPerPerson(): Flow<List<PersonPending>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertFD(fd: FDEntity): Long
+
+    @Update
+    suspend fun updateFD(fd: FDEntity)
+
+    @Query("SELECT * FROM fds ORDER BY startDate DESC")
+    fun allFDs(): Flow<List<FDEntity>>
+
+    @Query("SELECT COALESCE(SUM(amount), 0.0) FROM fds WHERE status = 'Active'")
+    fun activeFDSum(): Flow<Double>
+
+    @Query("SELECT * FROM fds WHERE status = 'Active' ORDER BY maturityDate ASC")
+    fun activeFDs(): Flow<List<FDEntity>>
+
+    @Query("SELECT * FROM transactions WHERE id = :id LIMIT 1")
+    suspend fun getTransactionById(id: Long): TransactionEntity?
+}
+""",
+    "app/src/main/java/com/example/cashupi/data/AppDatabase.kt": """
+package com.example.cashupi.data
+
+import android.content.Context
+import androidx.room.Database
+import androidx.room.Room
+import androidx.room.RoomDatabase
+
+@Database(entities = [TransactionEntity::class, FDEntity::class], version = 1, exportSchema = false)
+abstract class AppDatabase : RoomDatabase() {
+    abstract fun dao(): AppDao
+
+    companion object {
+        @Volatile private var INSTANCE: AppDatabase? = null
+        fun getInstance(context: Context): AppDatabase =
+            INSTANCE ?: synchronized(this) {
+                INSTANCE ?: Room.databaseBuilder(
+                    context.applicationContext,
+                    AppDatabase::class.java,
+                    "cashupi-db"
+                ).fallbackToDestructiveMigration().build().also { INSTANCE = it }
+            }
+    }
+}
+""",
+    "app/src/main/java/com/example/cashupi/repo/CashUpiRepository.kt": """
+package com.example.cashupi.repo
+
+import com.example.cashupi.data.*
+import kotlinx.coroutines.flow.Flow
+
+class CashUpiRepository(private val dao: AppDao) {
+
+    suspend fun addTransaction(tx: TransactionEntity) = dao.insertTransaction(tx)
+    suspend fun deleteTransaction(tx: TransactionEntity) = dao.deleteTransaction(tx)
+
+    fun recentTransactions(limit: Int = 5): Flow<List<TransactionEntity>> = dao.recentTransactions(limit)
+    fun allTransactions(): Flow<List<TransactionEntity>> = dao.allTransactions()
+
+    fun walletBalanceFlow(wallet: String): Flow<Double> = dao.walletBalanceFlow(wallet)
+    fun walletsBalanceFlow(wallets: List<String>): Flow<Double> = dao.walletsBalanceFlow(wallets)
+
+    fun pendingPerPerson(): Flow<List<PersonPending>> = dao.pendingPerPerson()
+
+    suspend fun addFD(fd: FDEntity) = dao.insertFD(fd)
+    suspend fun updateFD(fd: FDEntity) = dao.updateFD(fd)
+    fun activeFDSum(): Flow<Double> = dao.activeFDSum()
+    fun activeFDs(): Flow<List<FDEntity>> = dao.activeFDs()
+    fun allFDs(): Flow<List<FDEntity>> = dao.allFDs()
+}
+""",
+    "app/src/main/java/com/example/cashupi/util/Extensions.kt": """
+package com.example.cashupi.util
+
+import java.text.NumberFormat
+import java.util.Locale
+
+fun Double.toINR(): String {
+    val fmt = NumberFormat.getCurrencyInstance(Locale("en", "IN"))
+    return fmt.format(this)
+}
+""",
+    "app/src/main/java/com/example/cashupi/ui/theme/Theme.kt": """
+package com.example.cashupi.ui.theme
+
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.lightColorScheme
+import androidx.compose.runtime.Composable
+
+private val LightColors = lightColorScheme(
+    primary = androidx.compose.ui.graphics.Color(0xFF00695C),
+    onPrimary = androidx.compose.ui.graphics.Color.White
+)
+
+private val DarkColors = darkColorScheme(
+    primary = androidx.compose.ui.graphics.Color(0xFF26A69A),
+    onPrimary = androidx.compose.ui.graphics.Color.Black
+)
+
+@Composable
+fun CashUpiTheme(content: @Composable () -> Unit) {
+    val colors = LightColors
+    MaterialTheme(
+        colorScheme = colors,
+        typography = androidx.compose.material3.Typography(),
+        content = content
+    )
+}
+""",
+    "app/src/main/java/com/example/cashupi/ui/MainActivity.kt": """
+package com.example.cashupi.ui
+
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.cashupi.data.AppDatabase
+import com.example.cashupi.repo.CashUpiRepository
+import com.example.cashupi.ui.theme.CashUpiTheme
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val db = AppDatabase.getInstance(applicationContext)
+        val repository = CashUpiRepository(db.dao())
+        setContent {
+            CashUpiTheme {
+                val vm: MainViewModel = viewModel(factory = MainViewModel.provideFactory(repository))
+                CashUpiApp(vm = vm)
+            }
+        }
+    }
+}
+""",
+    "app/src/main/java/com/example/cashupi/ui/MainViewModel.kt": """
+package com.example.cashupi.ui
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
+import com.example.cashupi.data.FDEntity
+import com.example.cashupi.data.TransactionEntity
+import com.example.cashupi.data.PersonPending
+import com.example.cashupi.repo.CashUpiRepository
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+
+class MainViewModel(private val repo: CashUpiRepository) : ViewModel() {
+
+    val cashBalance: StateFlow<Double> = repo.walletBalanceFlow("Cash")
+        .stateIn(viewModelScope, SharingStarted.Lazily, 0.0)
+
+    val upiBalance: StateFlow<Double> = repo.walletBalanceFlow("UPI")
+        .stateIn(viewModelScope, SharingStarted.Lazily, 0.0)
+
+    val totalWalletBalance: StateFlow<Double> = repo.walletsBalanceFlow(listOf("Cash", "UPI"))
+        .stateIn(viewModelScope, SharingStarted.Lazily, 0.0)
+
+    val activeFDSum = repo.activeFDSum()
+        .map { it }
+        .stateIn(viewModelScope, SharingStarted.Lazily, 0.0)
+
+    val recentTransactions = repo.recentTransactions(5)
+        .stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
+
+    val allTransactions = repo.allTransactions()
+        .stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
+
+    val pendingPerPerson = repo.pendingPerPerson()
+        .stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
+
+    val activeFDs = repo.activeFDs()
+        .stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
+
+    fun addTransaction(tx: TransactionEntity) = viewModelScope.launch {
+        repo.addTransaction(tx)
+    }
+
+    fun deleteTransaction(tx: TransactionEntity) = viewModelScope.launch {
+        repo.deleteTransaction(tx)
+    }
+
+    fun addFD(fd: FDEntity) = viewModelScope.launch {
+        repo.addFD(fd)
+    }
+
+    fun updateFD(fd: FDEntity) = viewModelScope.launch {
+        repo.updateFD(fd)
+    }
+
+    companion object {
+        fun provideFactory(repo: CashUpiRepository): ViewModelProvider.Factory {
+            return object : ViewModelProvider.Factory {
+                @Suppress("UNCHECKED_CAST")
+                override fun <T : ViewModel> create(modelClass: Class<T>): T {
+                    return MainViewModel(repo) as T
+                }
+            }
+        }
+    }
+}
+""",
+    "app/src/main/java/com/example/cashupi/ui/CashUpiApp.kt": """
+package com.example.cashupi.ui
+
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material.*
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Pending
+import androidx.compose.material.icons.filled.Savings
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+
+@Composable
+fun CashUpiApp(vm: MainViewModel) {
+    val navItems = listOf(
+        NavItem("home", "Home", Icons.Default.Home),
+        NavItem("pending", "Pending", Icons.Default.Pending),
+        NavItem("fds", "FDs", Icons.Default.Savings),
+        NavItem("history", "History", Icons.Default.History)
+    )
+
+    var current by remember { mutableStateOf("home") }
+
+    Scaffold(
+        bottomBar = {
+            BottomNavigation {
+                navItems.forEach { item ->
+                    BottomNavigationItem(
+                        icon = { Icon(item.icon, contentDescription = item.title) },
+                        selected = current == item.route,
+                        label = { Text(item.title) },
+                        onClick = { current = item.route }
+                    )
+                }
+            }
+        }
+    ) { innerPadding ->
+        when (current) {
+            "home" -> com.example.cashupi.ui.home.HomeScreen(vm = vm, modifier = Modifier.padding(innerPadding))
+            "pending" -> com.example.cashupi.ui.pending.PendingScreen(vm = vm, modifier = Modifier.padding(innerPadding))
+            "fds" -> com.example.cashupi.ui.fd.FDScreen(vm = vm, modifier = Modifier.padding(innerPadding))
+            "history" -> com.example.cashupi.ui.history.HistoryScreen(vm = vm, modifier = Modifier.padding(innerPadding))
+        }
+    }
+}
+
+data class NavItem(val route: String, val title: String, val icon: androidx.compose.ui.graphics.vector.ImageVector)
+""",
+    # For brevity include a minimal HomeScreen, AddTransactionSheet, PendingScreen, FDScreen, HistoryScreen
+    "app/src/main/java/com/example/cashupi/ui/home/HomeScreen.kt": """
+package com.example.cashupi.ui.home
+
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material.*
+import androidx.compose.material.Card
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import com.example.cashupi.data.TransactionEntity
+import com.example.cashupi.ui.MainViewModel
+import com.example.cashupi.util.toINR
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import com.example.cashupi.ui.add.AddTransactionSheet
+import kotlinx.coroutines.launch
+
+@Composable
+fun HomeScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
+    val total by vm.totalWalletBalance.collectAsState()
+    val cash by vm.cashBalance.collectAsState()
+    val upi by vm.upiBalance.collectAsState()
+    val activeFD by vm.activeFDSum.collectAsState()
+    val recent by vm.recentTransactions.collectAsState()
+    val coroutineScope = rememberCoroutineScope()
+    var showAdd by remember { mutableStateOf(false) }
+
+    Box(modifier = modifier.fillMaxSize()) {
+        Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+            Card(modifier = Modifier.fillMaxWidth(), elevation = 8.dp) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text("Available Balance", style = MaterialTheme.typography.h6)
+                    Spacer(Modifier.height(8.dp))
+                    Text(text = total.toINR(), style = MaterialTheme.typography.h4)
+                    Spacer(Modifier.height(12.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Column { Text("Cash"); Text(cash.toINR()) }
+                        Column { Text("UPI"); Text(upi.toINR()) }
+                        Column { Text("Active FDs"); Text(activeFD.toINR()) }
+                    }
+                }
+            }
+            Spacer(Modifier.height(16.dp))
+            Text("Recent", style = MaterialTheme.typography.h6)
+            Spacer(Modifier.height(8.dp))
+            LazyColumn { items(recent) { tx -> TransactionRow(tx = tx) } }
+        }
+
+        FloatingActionButton(onClick = { showAdd = true }, modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp)) {
+            Icon(Icons.Default.Add, contentDescription = "Add")
+        }
+
+        if (showAdd) {
+            AddTransactionSheet(onClose = { showAdd = false }, onSave = { tx -> coroutineScope.launch { vm.addTransaction(tx) }; showAdd = false })
+        }
+    }
+}
+
+@Composable
+private fun TransactionRow(tx: TransactionEntity) {
+    Card(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp), elevation = 2.dp) {
+        Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text(text = tx.type, style = MaterialTheme.typography.subtitle1)
+                Text(text = tx.category ?: "", style = MaterialTheme.typography.body2)
+            }
+            Text(text = tx.amount.toINR())
+        }
+    }
+}
+""",
+    "app/src/main/java/com/example/cashupi/ui/add/AddTransactionSheet.kt": """
+package com.example.cashupi.ui.add
+
+import androidx.compose.foundation.layout.*
+import androidx.compose.material.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import com.example.cashupi.data.TransactionEntity
+import kotlinx.coroutines.launch
+
+@Composable
+fun AddTransactionSheet(onClose: () -> Unit, onSave: (TransactionEntity) -> Unit) {
+    val types = listOf("Income", "Expense", "Transfer", "Money Given", "Money Returned", "FD Created", "FD Matured", "FD Interest Payout", "Opening Balance")
+    var expanded by remember { mutableStateOf(false) }
+    var selectedType by remember { mutableStateOf(types.first()) }
+    var amountText by remember { mutableStateOf("") }
+    var wallet by remember { mutableStateOf("UPI") }
+    var fromWallet by remember { mutableStateOf("") }
+    var toWallet by remember { mutableStateOf("") }
+    var person by remember { mutableStateOf("") }
+    var category by remember { mutableStateOf("") }
+    var note by remember { mutableStateOf("") }
+
+    Surface(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text("Add Transaction", style = MaterialTheme.typography.h6)
+            Spacer(Modifier.height(8.dp))
+
+            Box {
+                OutlinedTextField(value = selectedType, onValueChange = {}, readOnly = true, label = { Text("Type") }, modifier = Modifier.fillMaxWidth())
+                DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                    types.forEach { t ->
+                        DropdownMenuItem(onClick = { selectedType = t; expanded = false }) { Text(t) }
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(value = amountText, onValueChange = { amountText = it }, label = { Text("Amount") }, modifier = Modifier.fillMaxWidth())
+            Spacer(Modifier.height(8.dp))
+
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(value = wallet, onValueChange = { wallet = it }, label = { Text("Wallet (Cash/UPI)") }, modifier = Modifier.weight(1f))
+                if (selectedType == "Transfer") {
+                    OutlinedTextField(value = fromWallet, onValueChange = { fromWallet = it }, label = { Text("From") }, modifier = Modifier.weight(1f))
+                    OutlinedTextField(value = toWallet, onValueChange = { toWallet = it }, label = { Text("To") }, modifier = Modifier.weight(1f))
+                }
+            }
+
+            Spacer(Modifier.height(8.dp))
+            if (selectedType == "Money Given" || selectedType == "Money Returned") {
+                OutlinedTextField(value = person, onValueChange = { person = it }, label = { Text("Person") }, modifier = Modifier.fillMaxWidth())
+            }
+
+            if (selectedType != "Transfer") {
+                OutlinedTextField(value = category, onValueChange = { category = it }, label = { Text("Category") }, modifier = Modifier.fillMaxWidth())
+            }
+
+            OutlinedTextField(value = note, onValueChange = { note = it }, label = { Text("Note") }, modifier = Modifier.fillMaxWidth())
+
+            Spacer(Modifier.height(12.dp))
+            Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
+                TextButton(onClick = onClose) { Text("Cancel") }
+                Spacer(Modifier.width(8.dp))
+                Button(onClick = {
+                    val amount = amountText.toDoubleOrNull() ?: 0.0
+                    val now = System.currentTimeMillis()
+                    val tx = TransactionEntity(date = now, type = selectedType, amount = amount, wallet = wallet,
+                        fromWallet = if (selectedType == "Transfer") fromWallet else null,
+                        toWallet = if (selectedType == "Transfer") toWallet else null,
+                        person = if (selectedType == "Money Given" || selectedType == "Money Returned") person else null,
+                        category = if (selectedType != "Transfer") category else null, note = note)
+                    onSave(tx)
+                }) { Text("Save") }
+            }
+        }
+    }
+}
+""",
+    "app/src/main/java/com/example/cashupi/ui/pending/PendingScreen.kt": """
+package com.example.cashupi.ui.pending
+
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material.Card
+import androidx.compose.material.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import com.example.cashupi.data.PersonPending
+import com.example.cashupi.ui.MainViewModel
+import com.example.cashupi.util.toINR
+
+@Composable
+fun PendingScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
+    val pending by vm.pendingPerPerson.collectAsState()
+    LazyColumn(modifier = modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        items(pending) { p -> PendingCard(p) }
+    }
+}
+
+@Composable
+fun PendingCard(p: PersonPending) {
+    Card(elevation = 4.dp, modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Text(text = p.person)
+            Spacer(modifier = Modifier.height(6.dp))
+            Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+                Column { Text("Given"); Text(p.given.toINR()) }
+                Column { Text("Returned"); Text(p.returned.toINR()) }
+                Column { Text("Pending"); Text(p.pending.toINR()) }
+            }
+        }
+    }
+}
+""",
+    "app/src/main/java/com/example/cashupi/ui/fd/FDScreen.kt": """
+package com.example.cashupi.ui.fd
+
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material.Button
+import androidx.compose.material.Card
+import androidx.compose.material.Text
+import androidx.compose.material.TextButton
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import com.example.cashupi.data.FDEntity
+import com.example.cashupi.ui.MainViewModel
+import com.example.cashupi.util.toINR
+import kotlinx.coroutines.launch
+
+@Composable
+fun FDScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
+    val fds by vm.activeFDs.collectAsState()
+    val coroutineScope = rememberCoroutineScope()
+    var showNewFd by remember { mutableStateOf(false) }
+
+    Column(modifier = modifier.fillMaxSize().padding(16.dp)) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text("Active FDs")
+            Button(onClick = { showNewFd = true }) { Text("New FD") }
+        }
+
+        Spacer(Modifier.height(8.dp))
+        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            items(fds) { fd ->
+                FDCard(fd = fd, onMature = {
+                    coroutineScope.launch {
+                        val matured = fd.copy(status = "Matured")
+                        vm.updateFD(matured)
+                        vm.addTransaction(com.example.cashupi.data.TransactionEntity(
+                            date = System.currentTimeMillis(), type = "FD Matured", amount = fd.amount, wallet = "UPI",
+                            fromWallet = null, toWallet = null, person = null, category = "FD Matured", note = "Matured: ${fd.bankName}"
+                        ))
+                    }
+                }, onCreditInterest = { interestAmount ->
+                    coroutineScope.launch {
+                        vm.addTransaction(com.example.cashupi.data.TransactionEntity(
+                            date = System.currentTimeMillis(), type = "FD Interest Payout", amount = interestAmount, wallet = "UPI",
+                            fromWallet = null, toWallet = null, person = null, category = "FD Interest", note = "Interest for FD ${fd.id}"
+                        ))
+                    }
+                })
+            }
+        }
+    }
+
+    if (showNewFd) {
+        NewFDDialog(onDismiss = { showNewFd = false }, onCreate = { fd ->
+            coroutineScope.launch {
+                vm.addFD(fd)
+                vm.addTransaction(com.example.cashupi.data.TransactionEntity(
+                    date = System.currentTimeMillis(), type = "FD Created", amount = fd.amount, wallet = "UPI",
+                    fromWallet = null, toWallet = null, person = null, category = "FD Created", note = "FD Created in ${fd.bankName}"
+                ))
+            }
+            showNewFd = false
+        })
+    }
+}
+
+@Composable
+fun FDCard(fd: FDEntity, onMature: () -> Unit, onCreditInterest: (Double) -> Unit) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp)) {
+            Text("FD @ ${fd.interestRate}% - ${fd.amount.toINR()}")
+            Spacer(Modifier.height(6.dp))
+            Text("Bank: ${fd.bankName ?: "Unknown"}")
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(onClick = { onCreditInterest(fd.amount * fd.interestRate / 100.0 / 12.0) }) { Text("Credit Interest") }
+                TextButton(onClick = onMature) { Text("Mature") }
+            }
+        }
+    }
+}
+""",
+    "app/src/main/java/com/example/cashupi/ui/fd/NewFDDialog.kt": """
+package com.example.cashupi.ui.fd
+
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
+import androidx.compose.material.AlertDialog
+import androidx.compose.material.Button
+import androidx.compose.material.OutlinedTextField
+import androidx.compose.material.Text
+import androidx.compose.runtime.*
+import androidx.compose.ui.unit.dp
+import com.example.cashupi.data.FDEntity
+
+@Composable
+fun NewFDDialog(onDismiss: () -> Unit, onCreate: (FDEntity) -> Unit) {
+    var amountText by remember { mutableStateOf("") }
+    var rateText by remember { mutableStateOf("") }
+    var maturityDaysText by remember { mutableStateOf("365") }
+    var bank by remember { mutableStateOf("") }
+
+    AlertDialog(onDismissRequest = onDismiss, title = { Text("New FD") }, text = {
+        Column {
+            OutlinedTextField(value = amountText, onValueChange = { amountText = it }, label = { Text("Amount") })
+            OutlinedTextField(value = rateText, onValueChange = { rateText = it }, label = { Text("Rate (%)") })
+            OutlinedTextField(value = maturityDaysText, onValueChange = { maturityDaysText = it }, label = { Text("Maturity days") })
+            OutlinedTextField(value = bank, onValueChange = { bank = it }, label = { Text("Bank") })
+            Spacer(modifier = androidx.compose.ui.Modifier.height(8.dp))
+        }
+    }, confirmButton = {
+        Button(onClick = {
+            val amount = amountText.toDoubleOrNull() ?: 0.0
+            val rate = rateText.toDoubleOrNull() ?: 0.0
+            val days = maturityDaysText.toLongOrNull() ?: 365L
+            val start = System.currentTimeMillis()
+            val maturity = start + days * 24L * 60L * 60L * 1000L
+            val fd = FDEntity(startDate = start, amount = amount, interestRate = rate, maturityDate = maturity, bankName = bank, note = null, status = "Active")
+            onCreate(fd)
+        }) { Text("Create") }
+    }, dismissButton = { Button(onClick = onDismiss) { Text("Cancel") } })
+}
+""",
+    "app/src/main/java/com/example/cashupi/ui/history/HistoryScreen.kt": """
+package com.example.cashupi.ui.history
+
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material.*
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import com.example.cashupi.data.TransactionEntity
+import com.example.cashupi.ui.MainViewModel
+import kotlinx.coroutines.launch
+import com.example.cashupi.util.toINR
+
+@OptIn(ExperimentalMaterialApi::class)
+@Composable
+fun HistoryScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
+    val all by vm.allTransactions.collectAsState()
+    val coroutineScope = rememberCoroutineScope()
+
+    LazyColumn(modifier = modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        items(all, key = { it.id }) { tx ->
+            val dismissState = rememberDismissState()
+            if (dismissState.isDismissed(DismissDirection.EndToStart)) {
+                LaunchedEffect(tx.id) { vm.deleteTransaction(tx) }
+            }
+            SwipeToDismiss(state = dismissState, background = {
+                Box(modifier = Modifier.fillMaxSize().padding(8.dp), contentAlignment = androidx.compose.ui.Alignment.CenterEnd) {
+                    Icon(Icons.Default.Delete, contentDescription = "Delete")
+                }
+            }, dismissContent = {
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Row(modifier = Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Column { Text(tx.type); Text(tx.category ?: "") }
+                        Text(tx.amount.toINR())
+                    }
+                }
+            }, directions = setOf(DismissDirection.EndToStart))
+        }
+    }
+}
+"""
+}
+
+def create_zip_bytes(file_map):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
+        # Add a README
+        readme = f"""Cash & UPI Money Manager - exported {datetime.utcnow().isoformat()}Z
+
+This ZIP contains a minimal Android app skeleton (Compose + Room + MVVM).
+Open in Android Studio, sync Gradle, enable kapt, and run on an emulator/device.
+"""
+        z.writestr("README.txt", readme)
+        # Write files
+        for path, content in file_map.items():
+            z.writestr(path, content.lstrip("\n"))
+    buf.seek(0)
+    return buf
+
+st.markdown("### Files included (skeleton)")
+st.write(list(files.keys())[:10])
+if len(files) > 10:
+    st.write(f"... (+{len(files)-10} more files)")
+
+zip_buf = create_zip_bytes(files)
+b = zip_buf.read()
+
+st.download_button(
+    label="Generate & download project ZIP",
+    data=b,
+    file_name="cashupi_project.zip",
+    mime="application/zip"
+)
+
+st.markdown("### After download: quick steps")
+st.markdown("""
+1. Unzip and open the project in Android Studio.
+2. Let Gradle sync. If kapt errors appear, ensure `kotlin-kapt` plugin is applied (it is in the included build.gradle).
+3. If Room annotation processing complains, run Build → Clean Project, then Rebuild.
+4. Run the app on an emulator or device.
+""")
+
+st.markdown("If you want, I can also: \n- Update versions in build.gradle to match a specific Compose/AGP toolchain\n- Add sample seed data insertion code\n- Convert the UI sheet to Material3 ModalBottomSheet\nTell me which.")
