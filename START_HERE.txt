@@ -1,0 +1,20 @@
+CASH & UPI MONEY MANAGER
+
+1. Open PowerShell in this folder.
+2. Install packages:
+   py -m pip install -r packages.txt
+
+3. Start:
+   py -m streamlit run cash_upi_manager.py
+
+4. Open:
+   http://localhost:8501
+
+IMPORTANT:
+- This version uses a NEW database file:
+  cash_upi_money_manager.db
+- It does not use the old my_money_tracker_v4 database.
+- Only Cash and UPI are transaction wallets.
+- Cash <-> UPI transfers move money between wallets and do not change combined Cash+UPI.
+- Money given / loans are excluded from available Cash/UPI while tracked as pending.
+- FD creation is from UPI and is shown separately as Active FD.
