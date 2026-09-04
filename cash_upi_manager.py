@@ -1,816 +1,750 @@
-import 'package:flutter/material.dart';
-import 'package:sqflite/sqflite.dart';
-import 'package:path/path.dart';
+import sqlite3
+from datetime import date, datetime
+from pathlib import Path
 
-void main() {
-  WidgetsFlutterBinding.ensureInitialized();
-  runApp(const CashUpiManagerApp());
-}
+import pandas as pd
+import streamlit as st
 
-// =========================================================================
-// DATABASE HELPER (SQFLITE)
-// =========================================================================
-class DatabaseHelper {
-  static final DatabaseHelper instance = DatabaseHelper._init();
-  static Database? _database;
+# =========================================================
+# APP CONFIG
+# =========================================================
+st.set_page_config(
+    page_title="Cash & UPI Money Manager",
+    page_icon="💰",
+    layout="wide",
+)
 
-  DatabaseHelper._init();
+BASE_DIR = Path(__file__).resolve().parent
+DB_FILE = BASE_DIR / "cash_upi_money_manager.db"
 
-  Future<Database> get database async {
-    if (_database != null) return _database!;
-    _database = await _initDB('cash_upi_manager.db');
-    return _database!;
-  }
 
-  Future<Database> _initDB(String filePath) async {
-    final dbPath = await getDatabasesPath();
-    final path = join(dbPath, filePath);
+# =========================================================
+# DATABASE
+# =========================================================
+def get_db():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-    return await openDatabase(
-      path,
-      version: 1,
-      onCreate: _createDB,
-    );
-  }
 
-  Future _createDB(Database db, int version) async {
-    await db.execute('''
-      CREATE TABLE transactions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        tx_date TEXT NOT NULL,
-        tx_type TEXT NOT NULL,
-        amount REAL NOT NULL,
-        wallet TEXT,
-        from_wallet TEXT,
-        to_wallet TEXT,
-        person TEXT,
-        category TEXT,
-        note TEXT,
-        created_at TEXT NOT NULL
-      )
-    ''');
+def init_db():
+    conn = get_db()
+    cur = conn.cursor()
 
-    await db.execute('''
-      CREATE TABLE fds (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        start_date TEXT NOT NULL,
-        amount REAL NOT NULL,
-        interest_rate REAL NOT NULL,
-        maturity_date TEXT,
-        bank_name TEXT,
-        note TEXT,
-        status TEXT NOT NULL DEFAULT 'Active',
-        created_at TEXT NOT NULL
-      )
-    ''');
-  }
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tx_date TEXT NOT NULL,
+            tx_type TEXT NOT NULL,
+            amount REAL NOT NULL CHECK(amount > 0),
+            wallet TEXT,
+            from_wallet TEXT,
+            to_wallet TEXT,
+            person TEXT,
+            category TEXT,
+            due_date TEXT,
+            note TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        )
+    """)
 
-  Future<int> insertTransaction(Map<String, dynamic> row) async {
-    final db = await instance.database;
-    return await db.insert('transactions', row);
-  }
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS fds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            start_date TEXT NOT NULL,
+            amount REAL NOT NULL CHECK(amount > 0),
+            interest_rate REAL DEFAULT 0,
+            maturity_date TEXT,
+            bank_name TEXT DEFAULT '',
+            note TEXT DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'Active',
+            created_at TEXT NOT NULL
+        )
+    """)
 
-  Future<List<Map<String, dynamic>>> queryTransactions() async {
-    final db = await instance.database;
-    return await db.query('transactions', orderBy: 'tx_date DESC, id DESC');
-  }
+    conn.commit()
+    conn.close()
 
-  Future<int> deleteTransaction(int id) async {
-    final db = await instance.database;
-    return await db.delete('transactions', where: 'id = ?', whereArgs: [id]);
-  }
 
-  Future<int> insertFd(Map<String, dynamic> row) async {
-    final db = await instance.database;
-    return await db.insert('fds', row);
-  }
+init_db()
 
-  Future<List<Map<String, dynamic>>> queryFds({String status = 'Active'}) async {
-    final db = await instance.database;
-    return await db.query('fds', where: 'status = ?', whereArgs: [status], orderBy: 'start_date DESC');
-  }
 
-  Future<int> updateFdStatus(int id, String status) async {
-    final db = await instance.database;
-    return await db.update('fds', {'status': status}, where: 'id = ?', whereArgs: [id]);
-  }
-}
+# =========================================================
+# HELPERS
+# =========================================================
+def now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-// =========================================================================
-// APP ROOT & THEME
-// =========================================================================
-class CashUpiManagerApp extends StatelessWidget {
-  const CashUpiManagerApp({super.key});
 
-  @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Cash & UPI Manager',
-      debugShowCheckedModeBanner: false,
-      themeMode: ThemeMode.system,
-      theme: ThemeData(
-        brightness: Brightness.light,
-        scaffoldBackgroundColor: const Color(0xFFF8FAFC),
-        primaryColor: const Color(0xFF2563EB),
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF2563EB),
-          brightness: Brightness.light,
-        ),
-        cardTheme: CardThemeData(
-          color: Colors.white,
-          elevation: 0,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(16),
-            side: const BorderSide(color: Color(0xFFCBD5E1), width: 1),
-          ),
-        ),
-      ),
-      darkTheme: ThemeData(
-        brightness: Brightness.dark,
-        scaffoldBackgroundColor: const Color(0xFF0B1020),
-        primaryColor: const Color(0xFF3B82F6),
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF3B82F6),
-          brightness: Brightness.dark,
-        ),
-        cardTheme: CardThemeData(
-          color: const Color(0xFF141C2E),
-          elevation: 0,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(16),
-            side: const BorderSide(color: Color(0x408091B4), width: 1),
-          ),
-        ),
-      ),
-      home: const MainNavigationScreen(),
-    );
-  }
-}
+def money(value):
+    return f"₹{float(value):,.2f}"
 
-// =========================================================================
-// MAIN NAVIGATION & TABS
-// =========================================================================
-class MainNavigationScreen extends StatefulWidget {
-  const MainNavigationScreen({super.key});
 
-  @override
-  State<MainNavigationScreen> createState() => _MainNavigationScreenState();
-}
+def execute(sql, params=()):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    conn.commit()
+    last_id = cur.lastrowid
+    conn.close()
+    return last_id
 
-class _MainNavigationScreenState extends State<MainNavigationScreen> {
-  int _currentIndex = 0;
 
-  final List<Widget> _screens = [
-    const DashboardTab(),
-    const AddTransactionTab(),
-    const PendingMoneyTab(),
-    const FdTab(),
-    const HistoryTab(),
-  ];
+def query(sql, params=()):
+    conn = get_db()
+    df = pd.read_sql_query(sql, conn, params=params)
+    conn.close()
+    return df
 
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      body: _screens[_currentIndex],
-      bottomNavigationBar: BottomNavigationBar(
-        currentIndex: _currentIndex,
-        onTap: (index) => setState(() => _currentIndex = index),
-        type: BottomNavigationBarType.fixed,
-        selectedItemColor: const Color(0xFF2563EB),
-        unselectedItemColor: Colors.grey,
-        items: const [
-          BottomNavigationBarItem(icon: Icon(Icons.home_rounded), label: 'Home'),
-          BottomNavigationBarItem(icon: Icon(Icons.add_circle_outline_rounded), label: 'Add'),
-          BottomNavigationBarItem(icon: Icon(Icons.hourglass_top_rounded), label: 'Pending'),
-          BottomNavigationBarItem(icon: Icon(Icons.account_balance_rounded), label: 'FDs'),
-          BottomNavigationBarItem(icon: Icon(Icons.history_rounded), label: 'History'),
+
+def wallet_balance(wallet):
+    """Available money currently in Cash or UPI."""
+    income = query(
+        "SELECT COALESCE(SUM(amount),0) AS n FROM transactions "
+        "WHERE tx_type='Income' AND wallet=?",
+        (wallet,),
+    ).iloc[0]["n"]
+
+    opening = query(
+        "SELECT COALESCE(SUM(amount),0) AS n FROM transactions "
+        "WHERE tx_type='Opening Balance' AND wallet=?",
+        (wallet,),
+    ).iloc[0]["n"]
+
+    expense = query(
+        "SELECT COALESCE(SUM(amount),0) AS n FROM transactions "
+        "WHERE tx_type='Expense' AND wallet=?",
+        (wallet,),
+    ).iloc[0]["n"]
+
+    transfer_in = query(
+        "SELECT COALESCE(SUM(amount),0) AS n FROM transactions "
+        "WHERE tx_type='Transfer' AND to_wallet=?",
+        (wallet,),
+    ).iloc[0]["n"]
+
+    transfer_out = query(
+        "SELECT COALESCE(SUM(amount),0) AS n FROM transactions "
+        "WHERE tx_type='Transfer' AND from_wallet=?",
+        (wallet,),
+    ).iloc[0]["n"]
+
+    given = query(
+        "SELECT COALESCE(SUM(amount),0) AS n FROM transactions "
+        "WHERE tx_type='Money Given' AND wallet=?",
+        (wallet,),
+    ).iloc[0]["n"]
+
+    returned = query(
+        "SELECT COALESCE(SUM(amount),0) AS n FROM transactions "
+        "WHERE tx_type='Money Returned' AND wallet=?",
+        (wallet,),
+    ).iloc[0]["n"]
+
+    fd_created = query(
+        "SELECT COALESCE(SUM(amount),0) AS n FROM transactions "
+        "WHERE tx_type='FD Created' AND wallet=?",
+        (wallet,),
+    ).iloc[0]["n"]
+
+    fd_returned = query(
+        "SELECT COALESCE(SUM(amount),0) AS n FROM transactions "
+        "WHERE tx_type='FD Matured' AND wallet=?",
+        (wallet,),
+    ).iloc[0]["n"]
+    
+    fd_interest = query(
+        "SELECT COALESCE(SUM(amount),0) AS n FROM transactions "
+        "WHERE tx_type='FD Interest Payout' AND wallet=?",
+        (wallet,),
+    ).iloc[0]["n"]
+
+    return float(
+        opening + income - expense
+        + transfer_in - transfer_out
+        - given + returned
+        - fd_created + fd_returned + fd_interest
+    )
+
+
+def pending_summary():
+    df = query("""
+        SELECT
+            person,
+            SUM(CASE WHEN tx_type='Money Given'
+                     THEN amount ELSE 0 END) AS given,
+            SUM(CASE WHEN tx_type='Money Returned'
+                     THEN amount ELSE 0 END) AS returned
+        FROM transactions
+        WHERE person IS NOT NULL AND TRIM(person) <> ''
+        GROUP BY person
+        ORDER BY person COLLATE NOCASE
+    """)
+    if df.empty:
+        return df
+
+    df["pending"] = (df["given"] - df["returned"]).clip(lower=0)
+    return df
+
+
+def active_fd_total():
+    row = query(
+        "SELECT COALESCE(SUM(amount),0) AS n FROM fds WHERE status='Active'"
+    ).iloc[0]
+    return float(row["n"])
+
+
+def total_pending():
+    p = pending_summary()
+    return float(p["pending"].sum()) if not p.empty else 0.0
+
+
+def people():
+    df = query("""
+        SELECT DISTINCT person
+        FROM transactions
+        WHERE person IS NOT NULL AND TRIM(person) <> ''
+        ORDER BY person COLLATE NOCASE
+    """)
+    return df["person"].tolist() if not df.empty else []
+
+
+# =========================================================
+# STYLE (VISUALLY CLEAR IN LIGHT & DARK MODE)
+# =========================================================
+if "dark" not in st.session_state:
+    st.session_state.dark = False
+
+if st.session_state.dark:
+    bg = "#0b1020"
+    card = "#141c2e"
+    card_border = "rgba(128,145,180,.25)"
+    text = "#f5f7ff"
+    muted = "#aab5ca"
+else:
+    bg = "#f8fafc"
+    card = "#ffffff"
+    card_border = "#cbd5e1"
+    text = "#0f172a"
+    muted = "#475569"
+
+st.markdown(
+    f"""
+    <style>
+    .stApp {{ background:{bg}; color:{text}; }}
+    [data-testid="stSidebar"] {{ background:{card}; border-right: 1px solid {card_border}; }}
+    [data-testid="stSidebar"] * {{ color:{text} !important; }}
+    .title {{ font-size:32px; font-weight:800; color:{text}; }}
+    .subtitle {{ color:{muted}; margin-bottom:20px; font-size:15px; }}
+    .card {{
+        background:{card};
+        border:1px solid {card_border};
+        border-radius:14px;
+        padding:20px;
+        margin-bottom:12px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    }}
+    [data-testid="stMetricValue"] {{ color: {text} !important; }}
+    [data-testid="stMetricLabel"] {{ color: {muted} !important; font-weight: 600 !important; }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# =========================================================
+# HEADER
+# =========================================================
+top1, top2 = st.columns([7, 1])
+with top1:
+    st.markdown('<div class="title">💰 Cash & UPI Money Manager</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="subtitle">Cash + UPI • Internal Transfers • Pending Money • Monthly FD Interest to UPI</div>',
+        unsafe_allow_html=True,
+    )
+with top2:
+    label = "🌙 Dark" if not st.session_state.dark else "☀️ Light"
+    if st.button(label, use_container_width=True):
+        st.session_state.dark = not st.session_state.dark
+        st.rerun()
+
+
+# =========================================================
+# NAVIGATION
+# =========================================================
+st.sidebar.title("Menu")
+page = st.sidebar.radio(
+    "Open",
+    [
+        "🏠 Dashboard",
+        "➕ Add Transaction",
+        "⏳ Pending Money",
+        "🏦 Fixed Deposits",
+        "📊 Reports",
+        "📋 History",
+    ],
+)
+
+st.sidebar.divider()
+st.sidebar.caption("Only Cash and UPI are active transaction wallets.")
+st.sidebar.caption("Cash ↔ UPI transfers do not change combined totals.")
+
+
+# =========================================================
+# DASHBOARD
+# =========================================================
+if page == "🏠 Dashboard":
+    cash = wallet_balance("Cash")
+    upi = wallet_balance("UPI")
+    available = cash + upi
+    pending = total_pending()
+    fd_total = active_fd_total()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("💵 Cash Total", money(cash))
+    c2.metric("📱 UPI Total", money(upi))
+    c3.metric("💰 Cash + UPI", money(available))
+    c4.metric("⏳ Pending Money", money(pending))
+
+    st.metric("🏦 Active FD Principal", money(fd_total))
+
+    st.markdown("### Overview Breakdown")
+    a, b, c = st.columns(3)
+    with a:
+        st.markdown(
+            f'<div class="card"><b>Cash Wallet</b><br><span style="font-size:20px; font-weight:700;">{money(cash)}</span><br>'
+            f'<small style="color:{muted};">Available physical cash on hand.</small></div>',
+            unsafe_allow_html=True,
+        )
+    with b:
+        st.markdown(
+            f'<div class="card"><b>UPI Wallet</b><br><span style="font-size:20px; font-weight:700;">{money(upi)}</span><br>'
+            f'<small style="color:{muted};">Available digital/UPI bank balance.</small></div>',
+            unsafe_allow_html=True,
+        )
+    with c:
+        st.markdown(
+            f'<div class="card"><b>Pending Outflow</b><br><span style="font-size:20px; font-weight:700;">{money(pending)}</span><br>'
+            f'<small style="color:{muted};">Money given out, awaiting return.</small></div>',
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("### Recent Transactions")
+    recent = query("""
+        SELECT
+            id AS ID, tx_date AS Date, tx_type AS Type, amount AS Amount,
+            wallet AS Wallet, from_wallet AS From_Wallet,
+            to_wallet AS To_Wallet, person AS Person, category AS Category,
+            note AS Note
+        FROM transactions
+        ORDER BY tx_date DESC, id DESC
+        LIMIT 15
+    """)
+    if recent.empty:
+        st.info("No transactions recorded yet.")
+    else:
+        st.dataframe(
+            recent.style.format({"Amount": "₹{:,.2f}"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+# =========================================================
+# ADD TRANSACTION
+# =========================================================
+elif page == "➕ Add Transaction":
+    st.subheader("➕ Add Transaction")
+
+    tx_type = st.selectbox(
+        "Transaction Type",
+        [
+            "Opening Balance",
+            "Income",
+            "Expense",
+            "Transfer",
+            "Money Given",
+            "Money Returned",
         ],
-      ),
-    );
-  }
-}
+    )
 
-// =========================================================================
-// 1. DASHBOARD TAB
-// =========================================================================
-class DashboardTab extends StatefulWidget {
-  const DashboardTab({super.key});
+    with st.form("transaction_form", clear_on_submit=True):
+        d = st.date_input("Date", date.today())
+        amount = st.number_input("Amount (₹)", min_value=0.01, step=100.0, format="%.2f")
 
-  @override
-  State<DashboardTab> createState() => _DashboardTabState();
-}
+        wallet = None
+        from_wallet = None
+        to_wallet = None
+        person = ""
+        category = ""
 
-class _DashboardTabState extends State<DashboardTab> {
-  double cashBalance = 0;
-  double upiBalance = 0;
-  double pendingTotal = 0;
-  double activeFdTotal = 0;
-  List<Map<String, dynamic>> recentTransactions = [];
+        if tx_type == "Transfer":
+            from_wallet = st.selectbox("From", ["Cash", "UPI"])
+            to_wallet = st.selectbox("To", ["UPI", "Cash"])
+            if from_wallet == to_wallet:
+                st.warning("From and To must be different.")
+        elif tx_type in ["Opening Balance", "Income", "Expense", "Money Given", "Money Returned"]:
+            wallet = st.selectbox("Wallet", ["Cash", "UPI"])
 
-  @override
-  void initState() {
-    super.initState();
-    _loadData();
-  }
+        if tx_type in ["Money Given", "Money Returned"]:
+            existing_people = people()
+            person_choice = st.selectbox(
+                "Person",
+                ["➕ New person"] + existing_people,
+            )
+            if person_choice == "➕ New person":
+                person = st.text_input("Person Name *")
+            else:
+                person = person_choice
 
-  Future<void> _loadData() async {
-    final txs = await DatabaseHelper.instance.queryTransactions();
-    final fds = await DatabaseHelper.instance.queryFds(status: 'Active');
+        if tx_type in ["Income", "Expense"]:
+            category = st.text_input("Category", placeholder="Salary, food, shopping, etc.")
 
-    double cash = 0;
-    double upi = 0;
-    Map<String, double> pendingMap = {};
+        note = st.text_area("Notes / Details")
 
-    for (var tx in txs) {
-      final type = tx['tx_type'];
-      final amount = tx['amount'] as double;
-      final wallet = tx['wallet'];
-      final from = tx['from_wallet'];
-      final to = tx['to_wallet'];
-      final person = tx['person'];
+        save = st.form_submit_button("💾 Save Transaction", type="primary")
 
-      if (wallet == 'Cash') {
-        if (type == 'Income' || type == 'Opening Balance' || type == 'Money Returned') cash += amount;
-        if (type == 'Expense' || type == 'Money Given') cash -= amount;
-      } else if (wallet == 'UPI') {
-        if (type == 'Income' || type == 'Opening Balance' || type == 'Money Returned' || type == 'FD Matured' || type == 'FD Interest Payout') upi += amount;
-        if (type == 'Expense' || type == 'Money Given' || type == 'FD Created') upi -= amount;
-      }
-
-      if (type == 'Transfer') {
-        if (from == 'Cash') cash -= amount;
-        if (from == 'UPI') upi -= amount;
-        if (to == 'Cash') cash += amount;
-        if (to == 'UPI') upi += amount;
-      }
-
-      if (person != null && person.toString().trim().isNotEmpty) {
-        pendingMap.putIfAbsent(person, () => 0);
-        if (type == 'Money Given') pendingMap[person] = pendingMap[person]! + amount;
-        if (type == 'Money Returned') pendingMap[person] = pendingMap[person]! - amount;
-      }
-    }
-
-    double totalPending = 0;
-    pendingMap.forEach((_, val) {
-      if (val > 0) totalPending += val;
-    });
-
-    double fdTotal = 0;
-    for (var fd in fds) {
-      fdTotal += fd['amount'] as double;
-    }
-
-    setState(() {
-      cashBalance = cash;
-      upiBalance = upi;
-      pendingTotal = totalPending;
-      activeFdTotal = fdTotal;
-      recentTransactions = txs.take(10).toList();
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final isDark = Theme.of(context).brightness == Brightness.dark;
-    final combined = cashBalance + upiBalance;
-
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('💰 Cash & UPI Manager', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
-        backgroundColor: Colors.transparent,
-        elevation: 0,
-      ),
-      body: RefreshIndicator(
-        onRefresh: _loadData,
-        child: SingleChildScrollView(
-          physics: const AlwaysScrollableScrollPhysics(),
-          padding: const EdgeInsets.all(16.0),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  Expanded(child: _metricCard('💵 Cash Balance', cashBalance, context)),
-                  const SizedBox(width: 12),
-                  Expanded(child: _metricCard('📱 UPI Balance', upiBalance, context)),
-                ],
-              ),
-              const SizedBox(height: 12),
-              Row(
-                children: [
-                  Expanded(child: _metricCard('💰 Combined Total', combined, context)),
-                  const SizedBox(width: 12),
-                  Expanded(child: _metricCard('⏳ Pending Money', pendingTotal, context)),
-                ],
-              ),
-              const SizedBox(height: 16),
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(20),
-                decoration: BoxDecoration(
-                  gradient: const LinearGradient(
-                    colors: [Color(0xFF2563EB), Color(0xFF1E40AF)],
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                  ),
-                  borderRadius: BorderRadius.circular(16),
+    if save:
+        if amount <= 0:
+            st.error("Amount must be greater than zero.")
+        elif tx_type == "Transfer" and from_wallet == to_wallet:
+            st.error("From and To wallets must be different.")
+        elif tx_type in ["Money Given", "Money Returned"] and not person.strip():
+            st.error("Please enter a person name.")
+        else:
+            execute(
+                """
+                INSERT INTO transactions
+                (tx_date, tx_type, amount, wallet, from_wallet, to_wallet,
+                 person, category, note, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    d.isoformat(),
+                    tx_type,
+                    float(amount),
+                    wallet,
+                    from_wallet,
+                    to_wallet,
+                    person.strip(),
+                    category.strip(),
+                    note.strip(),
+                    now(),
                 ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text('🏦 Active Fixed Deposits', style: TextStyle(color: Colors.white70, fontSize: 14, fontWeight: FontWeight.w600)),
-                    const SizedBox(height: 6),
-                    Text('₹${activeFdTotal.toStringAsFixed(2)}', style: const TextStyle(color: Colors.white, fontSize: 26, fontWeight: FontWeight.bold)),
-                    const SizedBox(height: 4),
-                    const Text('Monthly interest routes automatically to UPI', style: TextStyle(color: Colors.white60, fontSize: 12)),
-                  ],
+            )
+            st.success(f"Saved {tx_type}: {money(amount)}")
+            st.rerun()
+
+
+# =========================================================
+# PENDING MONEY
+# =========================================================
+elif page == "⏳ Pending Money":
+    st.subheader("⏳ Pending Money Tracker")
+
+    st.write(
+        "Money given to other individuals is tracked here. "
+        "It is separated from your available Cash and UPI balances."
+    )
+
+    p = pending_summary()
+
+    if p.empty:
+        st.info("No pending money records.")
+    else:
+        display = p.rename(
+            columns={
+                "person": "Person",
+                "given": "Total Given",
+                "returned": "Total Returned",
+                "pending": "Pending",
+            }
+        )
+        st.dataframe(
+            display.style.format(
+                {
+                    "Total Given": "₹{:,.2f}",
+                    "Total Returned": "₹{:,.2f}",
+                    "Pending": "₹{:,.2f}",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("### Person Transaction Breakdown")
+        person = st.selectbox("Select person", p["person"].tolist())
+        detail = query("""
+            SELECT
+                id AS ID, tx_date AS Date, tx_type AS Type, amount AS Amount,
+                wallet AS Wallet, note AS Notes
+            FROM transactions
+            WHERE person=?
+            ORDER BY tx_date DESC, id DESC
+        """, (person,))
+        st.dataframe(
+            detail.style.format({"Amount": "₹{:,.2f}"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+# =========================================================
+# FIXED DEPOSITS (WITH MONTHLY INTEREST TO UPI)
+# =========================================================
+elif page == "🏦 Fixed Deposits":
+    st.subheader("🏦 Fixed Deposits & Monthly UPI Payouts")
+    st.caption("Creating an FD deducts the principal from your UPI balance. Monthly interest payouts deposit directly into your UPI wallet.")
+
+    active = query("""
+        SELECT
+            id AS ID, start_date AS "Start Date", amount AS Amount,
+            interest_rate AS "Interest %", maturity_date AS "Maturity Date",
+            bank_name AS Bank, note AS Notes
+        FROM fds
+        WHERE status='Active'
+        ORDER BY start_date DESC, id DESC
+    """)
+
+    if active.empty:
+        st.info("No active Fixed Deposits found.")
+    else:
+        st.markdown("### Active Fixed Deposits")
+        st.dataframe(
+            active.style.format({
+                "Amount": "₹{:,.2f}",
+                "Interest %": "{:.2f}%"
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.markdown("---")
+    col_create, col_payout = st.columns(2)
+
+    with col_create:
+        st.markdown("### ➕ Create New FD")
+        with st.form("fd_form", clear_on_submit=True):
+            fd_date = st.date_input("FD Start Date", date.today())
+            fd_amount = st.number_input(
+                "FD Principal Amount (₹)",
+                min_value=0.01,
+                step=1000.0,
+                format="%.2f",
+            )
+            fd_rate = st.number_input(
+                "Annual Interest Rate (%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=6.5,
+                step=0.1,
+            )
+            fd_maturity = st.date_input("Maturity Date", date.today())
+            bank = st.text_input("Bank / Institution Name")
+            fd_note = st.text_area("FD Notes")
+            create_fd = st.form_submit_button("🏦 Create FD from UPI", type="primary")
+
+        if create_fd:
+            if fd_amount > wallet_balance("UPI"):
+                st.error(
+                    f"Insufficient available UPI balance. Available UPI: {money(wallet_balance('UPI'))}"
+                )
+            elif fd_maturity < fd_date:
+                st.error("Maturity date cannot precede start date.")
+            else:
+                execute(
+                    """
+                    INSERT INTO fds
+                    (start_date, amount, interest_rate, maturity_date, bank_name,
+                     note, status, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 'Active', ?)
+                    """,
+                    (
+                        fd_date.isoformat(),
+                        float(fd_amount),
+                        float(fd_rate),
+                        fd_maturity.isoformat(),
+                        bank.strip(),
+                        fd_note.strip(),
+                        now(),
+                    ),
+                )
+
+                execute(
+                    """
+                    INSERT INTO transactions
+                    (tx_date, tx_type, amount, wallet, category, note, created_at)
+                    VALUES (?, 'FD Created', ?, 'UPI', 'FD', ?, ?)
+                    """,
+                    (
+                        fd_date.isoformat(),
+                        float(fd_amount),
+                        f"FD created from UPI. {fd_note.strip()}".strip(),
+                        now(),
+                    ),
+                )
+                st.success(f"FD successfully created: {money(fd_amount)} deducted from UPI.")
+                st.rerun()
+
+    with col_payout:
+        st.markdown("### 💸 Record Monthly Interest (to UPI)")
+        active_ids = active["ID"].tolist() if not active.empty else []
+        if active_ids:
+            with st.form("interest_form", clear_on_submit=True):
+                sel_fd_id = st.selectbox("Select Active FD ID", active_ids)
+                payout_date = st.date_input("Interest Date", date.today())
+                
+                selected_row = active[active["ID"] == sel_fd_id].iloc[0]
+                suggested_monthly_interest = round((selected_row["Amount"] * (selected_row["Interest %"] / 100)) / 12, 2)
+                
+                interest_amount = st.number_input(
+                    "Monthly Interest Amount Received (₹)",
+                    min_value=0.01,
+                    value=float(suggested_monthly_interest),
+                    step=10.0,
+                    format="%.2f",
+                )
+                interest_note = st.text_input("Note (e.g., 'Monthly interest for May')", value="Monthly FD Interest")
+                submit_interest = st.form_submit_button("📥 Credit Interest to UPI", type="primary")
+
+            if submit_interest:
+                execute(
+                    """
+                    INSERT INTO transactions
+                    (tx_date, tx_type, amount, wallet, category, note, created_at)
+                    VALUES (?, 'FD Interest Payout', ?, 'UPI', 'FD Interest', ?, ?)
+                    """,
+                    (
+                        payout_date.isoformat(),
+                        float(interest_amount),
+                        f"FD #{sel_fd_id} monthly interest payout. {interest_note}".strip(),
+                        now(),
+                    ),
+                )
+                st.success(f"Successfully credited {money(interest_amount)} interest to your UPI wallet.")
+                st.rerun()
+        else:
+            st.info("Create an active FD to log monthly interest payouts.")
+
+    st.markdown("---")
+    st.markdown("### ↩️ Mature / Close FD")
+    if active_ids:
+        with st.form("maturity_form"):
+            fd_id = st.selectbox("Select FD ID to Close", active_ids, key="close_fd_select")
+            selected = active[active["ID"] == fd_id].iloc[0]
+            maturity_amount = st.number_input(
+                "Total Principal Returned to UPI (₹)",
+                min_value=0.01,
+                value=float(selected["Amount"]),
+                step=100.0,
+                format="%.2f",
+            )
+            close_fd_btn = st.form_submit_button("↩️ Mature & Return Principal to UPI")
+
+        if close_fd_btn:
+            execute(
+                "UPDATE fds SET status='Matured' WHERE id=?",
+                (int(fd_id),),
+            )
+            execute(
+                """
+                INSERT INTO transactions
+                (tx_date, tx_type, amount, wallet, category, note, created_at)
+                VALUES (?, 'FD Matured', ?, 'UPI', 'FD', ?, ?)
+                """,
+                (
+                    date.today().isoformat(),
+                    float(maturity_amount),
+                    f"FD #{fd_id} matured principal returned.",
+                    now(),
                 ),
-              ),
-              const SizedBox(height: 24),
-              const Text('Recent Transactions', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-              const SizedBox(height: 12),
-              recentTransactions.isEmpty
-                  ? const Padding(padding: EdgeInsets.all(30), child: Center(child: Text('No transactions yet.')))
-                  : ListView.builder(
-                      shrinkWrap: true,
-                      physics: const NeverScrollableScrollPhysics(),
-                      itemCount: recentTransactions.length,
-                      itemBuilder: (context, index) {
-                        final tx = recentTransactions[index];
-                        final isPositive = ['Income', 'Opening Balance', 'Money Returned', 'FD Matured', 'FD Interest Payout'].contains(tx['tx_type']);
-                        return Container(
-                          margin: const EdgeInsets.only(bottom: 10),
-                          padding: const EdgeInsets.all(14),
-                          decoration: BoxDecoration(
-                            color: isDark ? const Color(0xFF141C2E) : Colors.white,
-                            borderRadius: BorderRadius.circular(12),
-                            border: Border.all(color: isDark ? const Color(0x408091B4) : const Color(0xFFCBD5E1), width: 1),
-                          ),
-                          child: Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: [
-                              Row(
-                                children: [
-                                  Container(
-                                    padding: const EdgeInsets.all(10),
-                                    decoration: BoxDecoration(
-                                      color: const Color(0xFF2563EB).withOpacity(0.1),
-                                      borderRadius: BorderRadius.circular(10),
-                                    ),
-                                    child: const Icon(Icons.receipt_long_rounded, color: Color(0xFF2563EB), size: 20),
-                                  ),
-                                  const SizedBox(width: 12),
-                                  Column(
-                                    crossAxisAlignment: CrossAxisAlignment.start,
-                                    children: [
-                                      Text(tx['tx_type'], style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
-                                      const SizedBox(height: 2),
-                                      Text('${tx['wallet'] ?? tx['from_wallet'] ?? ''} • ${tx['tx_date']}', style: TextStyle(color: Colors.grey, fontSize: 12)),
-                                    ],
-                                  ),
-                                ],
-                              ),
-                              Text(
-                                '${isPositive ? "+" : "-"}₹${(tx['amount'] as double).toStringAsFixed(2)}',
-                                style: TextStyle(color: isPositive ? Colors.green : Colors.redAccent, fontWeight: FontWeight.bold, fontSize: 15),
-                              ),
-                            ],
-                          ),
-                        );
-                      },
-                    ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
+            )
+            st.success("FD marked as Matured and principal returned to UPI wallet.")
+            st.rerun()
 
-  Widget _metricCard(String title, double amount, BuildContext context) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(title, style: TextStyle(color: Theme.of(context).hintColor, fontSize: 13, fontWeight: FontWeight.w600)),
-            const SizedBox(height: 8),
-            Text('₹${amount.toStringAsFixed(2)}', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-          ],
-        ),
-      ),
-    );
-  }
-}
 
-// =========================================================================
-// 2. ADD TRANSACTION TAB
-// =========================================================================
-class AddTransactionTab extends StatefulWidget {
-  const AddTransactionTab({super.key});
+# =========================================================
+# REPORTS
+# =========================================================
+elif page == "📊 Reports":
+    st.subheader("📊 Financial Reports")
 
-  @override
-  State<AddTransactionTab> createState() => _AddTransactionTabState();
-}
+    c1, c2 = st.columns(2)
+    with c1:
+        start = st.date_input("From Date", date.today().replace(day=1))
+    with c2:
+        end = st.date_input("To Date", date.today())
 
-class _AddTransactionTabState extends State<AddTransactionTab> {
-  String txType = 'Income';
-  final _amountController = TextEditingController();
-  final _personController = TextEditingController();
-  final _categoryController = TextEditingController();
-  final _noteController = TextEditingController();
-  String selectedWallet = 'UPI';
-  String fromWallet = 'Cash';
-  String toWallet = 'UPI';
-  DateTime selectedDate = DateTime.now();
+    if start > end:
+        st.error("From date must precede To date.")
+    else:
+        df = query("""
+            SELECT
+                id AS ID, tx_date AS Date, tx_type AS Type, amount AS Amount,
+                wallet AS Wallet, from_wallet AS From_Wallet,
+                to_wallet AS To_Wallet, person AS Person,
+                category AS Category, note AS Notes
+            FROM transactions
+            WHERE tx_date BETWEEN ? AND ?
+            ORDER BY tx_date, id
+        """, (start.isoformat(), end.isoformat()))
 
-  void _saveTransaction() async {
-    final amount = double.tryParse(_amountController.text) ?? 0;
-    if (amount <= 0) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Please enter a valid amount')));
-      return;
-    }
+        if df.empty:
+            st.info("No transactions found in this date range.")
+        else:
+            st.dataframe(
+                df.style.format({"Amount": "₹{:,.2f}"}),
+                use_container_width=True,
+                hide_index=True,
+            )
 
-    await DatabaseHelper.instance.insertTransaction({
-      'tx_date': selectedDate.toIso8601String().split('T')[0],
-      'tx_type': txType,
-      'amount': amount,
-      'wallet': txType == 'Transfer' ? null : selectedWallet,
-      'from_wallet': txType == 'Transfer' ? fromWallet : null,
-      'to_wallet': txType == 'Transfer' ? toWallet : null,
-      'person': _personController.text.trim(),
-      'category': _categoryController.text.trim(),
-      'note': _noteController.text.trim(),
-      'created_at': DateTime.now().toString(),
-    });
+            st.markdown("### Totals by Transaction Type")
+            totals = df.groupby("Type", as_index=False)["Amount"].sum()
+            st.dataframe(
+                totals.style.format({"Amount": "₹{:,.2f}"}),
+                use_container_width=True,
+                hide_index=True,
+            )
 
-    _amountController.clear();
-    _personController.clear();
-    _categoryController.clear();
-    _noteController.clear();
 
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Saved $txType successfully!')));
-  }
+# =========================================================
+# HISTORY / DELETE
+# =========================================================
+elif page == "📋 History":
+    st.subheader("📋 Complete Transaction History")
 
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('➕ Add Transaction')),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          children: [
-            DropdownButtonFormField<String>(
-              value: txType,
-              decoration: InputDecoration(labelText: 'Transaction Type', border: OutlineInputBorder(borderRadius: BorderRadius.circular(12))),
-              items: ['Opening Balance', 'Income', 'Expense', 'Transfer', 'Money Given', 'Money Returned']
-                  .map((type) => DropdownMenuItem(value: type, child: Text(type)))
-                  .toList(),
-              onChanged: (val) => setState(() => txType = val!),
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: _amountController,
-              keyboardType: const TextInputType.numberWithOptions(decimal: true),
-              decoration: InputDecoration(labelText: 'Amount (₹)', border: OutlineInputBorder(borderRadius: BorderRadius.circular(12))),
-            ),
-            const SizedBox(height: 16),
-            if (txType == 'Transfer') ...[
-              Row(
-                children: [
-                  Expanded(
-                    child: DropdownButtonFormField<String>(
-                      value: fromWallet,
-                      decoration: InputDecoration(labelText: 'From Wallet', border: OutlineInputBorder(borderRadius: BorderRadius.circular(12))),
-                      items: ['Cash', 'UPI'].map((w) => DropdownMenuItem(value: w, child: Text(w))).toList(),
-                      onChanged: (val) => setState(() => fromWallet = val!),
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: DropdownButtonFormField<String>(
-                      value: toWallet,
-                      decoration: InputDecoration(labelText: 'To Wallet', border: OutlineInputBorder(borderRadius: BorderRadius.circular(12))),
-                      items: ['Cash', 'UPI'].map((w) => DropdownMenuItem(value: w, child: Text(w))).toList(),
-                      onChanged: (val) => setState(() => toWallet = val!),
-                    ),
-                  ),
-                ],
-              ),
-            ] else ...[
-              DropdownButtonFormField<String>(
-                value: selectedWallet,
-                decoration: InputDecoration(labelText: 'Wallet', border: OutlineInputBorder(borderRadius: BorderRadius.circular(12))),
-                items: ['Cash', 'UPI'].map((w) => DropdownMenuItem(value: w, child: Text(w))).toList(),
-                onChanged: (val) => setState(() => selectedWallet = val!),
-              ),
-            ],
-            if (txType == 'Money Given' || txType == 'Money Returned') ...[
-              const SizedBox(height: 16),
-              TextField(
-                controller: _personController,
-                decoration: InputDecoration(labelText: 'Person Name', border: OutlineInputBorder(borderRadius: BorderRadius.circular(12))),
-              ),
-            ],
-            if (txType == 'Income' || txType == 'Expense') ...[
-              const SizedBox(height: 16),
-              TextField(
-                controller: _categoryController,
-                decoration: InputDecoration(labelText: 'Category (e.g., Food, Salary)', border: OutlineInputBorder(borderRadius: BorderRadius.circular(12))),
-              ),
-            ],
-            const SizedBox(height: 16),
-            TextField(
-              controller: _noteController,
-              decoration: InputDecoration(labelText: 'Notes / Details', border: OutlineInputBorder(borderRadius: BorderRadius.circular(12))),
-            ),
-            const SizedBox(height: 24),
-            SizedBox(
-              width: double.infinity,
-              height: 50,
-              child: ElevatedButton(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF2563EB),
-                  foregroundColor: Colors.white,
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                ),
-                onPressed: _saveTransaction,
-                child: const Text('💾 Save Transaction', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
+    df = query("""
+        SELECT
+            id AS ID, tx_date AS Date, tx_type AS Type, amount AS Amount,
+            wallet AS Wallet, from_wallet AS From_Wallet,
+            to_wallet AS To_Wallet, person AS Person,
+            category AS Category, due_date AS "Due Date", note AS Notes
+        FROM transactions
+        ORDER BY tx_date DESC, id DESC
+    """)
 
-// =========================================================================
-// 3. PENDING MONEY TAB
-// =========================================================================
-class PendingMoneyTab extends StatefulWidget {
-  const PendingMoneyTab({super.key});
+    if df.empty:
+        st.info("No transactions recorded yet.")
+    else:
+        st.dataframe(
+            df.style.format({"Amount": "₹{:,.2f}"}),
+            use_container_width=True,
+            hide_index=True,
+        )
 
-  @override
-  State<PendingMoneyTab> createState() => _PendingMoneyTabState();
-}
+        st.divider()
+        st.markdown("### Delete Transaction")
 
-class _PendingMoneyTabState extends State<PendingMoneyTab> {
-  Map<String, double> pendingDetails = {};
+        tx_id = st.number_input("Transaction ID to Delete", min_value=1, step=1)
 
-  @override
-  void initState() {
-    super.initState();
-    _loadPending();
-  }
-
-  Future<void> _loadPending() async {
-    final txs = await DatabaseHelper.instance.queryTransactions();
-    Map<String, double> map = {};
-    for (var tx in txs) {
-      final person = tx['person'];
-      final type = tx['tx_type'];
-      final amount = tx['amount'] as double;
-      if (person != null && person.toString().trim().isNotEmpty) {
-        map.putIfAbsent(person, () => 0);
-        if (type == 'Money Given') map[person] = map[person]! + amount;
-        if (type == 'Money Returned') map[person] = map[person]! - amount;
-      }
-    }
-    setState(() {
-      pendingDetails = Map.fromEntries(map.entries.where((e) => e.value > 0));
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('⏳ Pending Money Tracker')),
-      body: pendingDetails.isEmpty
-          ? const Center(child: Text('No pending money records.'))
-          : ListView.builder(
-              padding: const EdgeInsets.all(16),
-              itemCount: pendingDetails.length,
-              itemBuilder: (context, index) {
-                final person = pendingDetails.keys.elementAt(index);
-                final amount = pendingDetails.values.elementAt(index);
-                return Card(
-                  margin: const EdgeInsets.only(bottom: 12),
-                  child: ListTile(
-                    title: Text(person, style: const TextStyle(fontWeight: FontWeight.bold)),
-                    subtitle: const Text('Pending Outflow'),
-                    trailing: Text('₹${amount.toStringAsFixed(2)}', style: const TextStyle(color: Colors.orange, fontWeight: FontWeight.bold, fontSize: 16)),
-                  ),
-                );
-              },
-            ),
-    );
-  }
-}
-
-// =========================================================================
-// 4. FIXED DEPOSITS TAB (WITH MONTHLY INTEREST TO UPI)
-// =========================================================================
-class FdTab extends StatefulWidget {
-  const FdTab({super.key});
-
-  @override
-  State<FdTab> createState() => _FdTabState();
-}
-
-class _FdTabState extends State<FdTab> {
-  List<Map<String, dynamic>> activeFds = [];
-  final _amountController = TextEditingController();
-  final _rateController = TextEditingController(text: '6.5');
-  final _bankController = TextEditingController();
-  final _noteController = TextEditingController();
-
-  @override
-  void initState() {
-    super.initState();
-    _loadFds();
-  }
-
-  Future<void> _loadFds() async {
-    final fds = await DatabaseHelper.instance.queryFds(status: 'Active');
-    setState(() => activeFds = fds);
-  }
-
-  void _createFd() async {
-    final amount = double.tryParse(_amountController.text) ?? 0;
-    final rate = double.tryParse(_rateController.text) ?? 0;
-    if (amount <= 0) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Enter valid principal amount')));
-      return;
-    }
-
-    await DatabaseHelper.instance.insertFd({
-      'start_date': DateTime.now().toIso8601String().split('T')[0],
-      'amount': amount,
-      'interest_rate': rate,
-      'maturity_date': DateTime.now().add(const Duration(days: 365)).toIso8601String().split('T')[0],
-      'bank_name': _bankController.text.trim(),
-      'note': _noteController.text.trim(),
-      'status': 'Active',
-      'created_at': DateTime.now().toString(),
-    });
-
-    await DatabaseHelper.instance.insertTransaction({
-      'tx_date': DateTime.now().toIso8601String().split('T')[0],
-      'tx_type': 'FD Created',
-      'amount': amount,
-      'wallet': 'UPI',
-      'note': 'FD created from UPI wallet',
-      'created_at': DateTime.now().toString(),
-    });
-
-    _amountController.clear();
-    _bankController.clear();
-    _noteController.clear();
-    _loadFds();
-    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('FD created successfully!')));
-  }
-
-  void _recordInterest(int fdId, double principal, double rate) async {
-    final monthlyInterest = roundVal((principal * (rate / 100)) / 12);
-    await DatabaseHelper.instance.insertTransaction({
-      'tx_date': DateTime.now().toIso8601String().split('T')[0],
-      'tx_type': 'FD Interest Payout',
-      'amount': monthlyInterest,
-      'wallet': 'UPI',
-      'note': 'FD #$fdId monthly interest credited to UPI',
-      'created_at': DateTime.now().toString(),
-    });
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Credited ₹$monthlyInterest interest to UPI!')));
-  }
-
-  double roundVal(double val) => double.parse(val.toStringAsFixed(2));
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('🏦 Fixed Deposits & Interest')),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text('Active Fixed Deposits', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 12),
-            activeFds.isEmpty
-                ? const Text('No active FDs.')
-                : ListView.builder(
-                    shrinkWrap: true,
-                    physics: const NeverScrollableScrollPhysics(),
-                    itemCount: activeFds.length,
-                    itemBuilder: (context, index) {
-                      final fd = activeFds[index];
-                      return Card(
-                        margin: const EdgeInsets.only(bottom: 12),
-                        child: Padding(
-                          padding: const EdgeInsets.all(16),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text('${fd['bank_name'] ?? 'Bank'} • ₹${fd['amount']}', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-                              const SizedBox(height: 4),
-                              Text('Interest Rate: ${fd['interest_rate']}% p.a.', style: const TextStyle(color: Colors.grey)),
-                              const SizedBox(height: 12),
-                              ElevatedButton.icon(
-                                style: ElevatedButton.styleFrom(backgroundColor: Colors.green, foregroundColor: Colors.white),
-                                icon: const Icon(Icons.download_rounded, size: 16),
-                                label: const Text('Record Monthly Interest to UPI'),
-                                onPressed: () => _recordInterest(fd['id'], fd['amount'], fd['interest_rate']),
-                              ),
-                            ],
-                          ),
-                        ),
-                      );
-                    },
-                  ),
-            const Divider(height: 40),
-            const Text('➕ Create FD from UPI', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 12),
-            TextField(controller: _amountController, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Principal Amount (₹)', border: OutlineInputBorder())),
-            const SizedBox(height: 12),
-            TextField(controller: _rateController, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Annual Interest %', border: OutlineInputBorder())),
-            const SizedBox(height: 12),
-            TextField(controller: _bankController, decoration: const InputDecoration(labelText: 'Bank Name', border: OutlineInputBorder())),
-            const SizedBox(height: 12),
-            TextField(controller: _noteController, decoration: const InputDecoration(labelText: 'Notes', border: OutlineInputBorder())),
-            const SizedBox(height: 16),
-            SizedBox(
-              width: double.infinity,
-              height: 50,
-              child: ElevatedButton(
-                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF2563EB), foregroundColor: Colors.white),
-                onPressed: _createFd,
-                child: const Text('Create FD', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-// =========================================================================
-// 5. HISTORY TAB & DELETION
-// =========================================================================
-class HistoryTab extends StatefulWidget {
-  const HistoryTab({super.key});
-
-  @override
-  State<HistoryTab> createState() => _HistoryTabState();
-}
-
-class _HistoryTabState extends State<HistoryTab> {
-  List<Map<String, dynamic>> transactions = [];
-
-  @override
-  void initState() {
-    super.initState();
-    _loadHistory();
-  }
-
-  Future<void> _loadHistory() async {
-    final txs = await DatabaseHelper.instance.queryTransactions();
-    setState(() => transactions = txs);
-  }
-
-  void _deleteTx(int id) async {
-    await DatabaseHelper.instance.deleteTransaction(id);
-    _loadHistory();
-    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Transaction deleted.')));
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('📋 Complete History')),
-      body: transactions.isEmpty
-          ? const Center(child: Text('No transaction history.'))
-          : ListView.builder(
-              padding: const EdgeInsets.all(16),
-              itemCount: transactions.length,
-              itemBuilder: (context, index) {
-                final tx = transactions[index];
-                return Card(
-                  margin: const EdgeInsets.only(bottom: 10),
-                  child: ListTile(
-                    title: Text(tx['tx_type'], style: const TextStyle(fontWeight: FontWeight.bold)),
-                    subtitle: Text('₹${tx['amount']} • ${tx['tx_date']}\n${tx['note'] ?? ''}'),
-                    isThreeLine: true,
-                    trailing: IconButton(
-                      icon: const Icon(Icons.delete_outline, color: Colors.red),
-                      onPressed: () => _deleteTx(tx['id']),
-                    ),
-                  ),
-                );
-              },
-            ),
-    );
-  }
-}
+        if st.button("🗑️ Delete Transaction"):
+            exists = query(
+                "SELECT id FROM transactions WHERE id=?",
+                (int(tx_id),),
+            )
+            if exists.empty:
+                st.error("Transaction ID not found.")
+            else:
+                execute("DELETE FROM transactions WHERE id=?", (int(tx_id),))
+                st.success(f"Transaction #{int(tx_id)} successfully deleted.")
+                st.rerun()
