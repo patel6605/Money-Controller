@@ -6,11 +6,30 @@ import pandas as pd
 import streamlit as st
 
 # =========================================================
-# APP CONFIG
+# HEADER
 # =========================================================
+top_logo, top1, top2 = st.columns([1, 6, 1])
+
+with top_logo:
+    # Adjust width as needed to fit your logo nicely
+    st.image("logo.png", width=80)
+
+with top1:
+    st.markdown('<div class="title">💰 Cash & UPI Money Manager</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="subtitle">Cash + UPI • Internal Transfers • Pending Money • Monthly FD Interest to UPI</div>',
+        unsafe_allow_html=True,
+    )
+
+with top2:
+    label = "🌙 Dark" if not st.session_state.dark else "☀️ Light"
+    if st.button(label, use_container_width=True):
+        st.session_state.dark = not st.session_state.dark
+        st.rerun()
+        
 st.set_page_config(
     page_title="Cash & UPI Money Manager",
-    page_icon="💰",
+    page_icon="logo.png",  # Uses your image as the browser tab icon
     layout="wide",
 )
 
